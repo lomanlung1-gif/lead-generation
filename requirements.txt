@@ -1,5 +1,7 @@
-networkx>=3.0
-openpyxl>=3.1
-pandas>=2.0
-PyYAML>=6.0
-openai>=1.0
+openai
+python-dotenv
+pandas
+networkx
+sentence-transformers
+openpyxl
+streamlit
