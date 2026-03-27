@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from altair import value
 import networkx as nx
 import pandas as pd
 from dotenv import load_dotenv
@@ -51,7 +50,6 @@ def clean(value: Any) -> Any:
     if not isinstance(value, str):
         return value
     return value.replace("\u200b", "").replace("\ufeff", "").strip()
-
 
 
 def build_graph(excel_path: str, node_sheet: str, edge_sheet: str) -> nx.DiGraph:
