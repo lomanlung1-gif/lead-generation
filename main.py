@@ -1,8 +1,8 @@
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import networkx as nx
 import pandas as pd
@@ -32,7 +32,7 @@ class LeadGenConfig:
     llm_batch_size: int = 10
     auto_write_rules: bool = False
     debug: bool = False
-    llm_model: str = "deepseek-reasoner"
+    llm_model: str = "deepseek-chat"
 
 
 @dataclass(frozen=True)
@@ -44,6 +44,10 @@ class GraphArtifacts:
     node_embs: Any
     edges: list[tuple[str, str, dict[str, Any]]]
     edge_embs: Any | None
+
+
+def with_topology(artifacts: GraphArtifacts, topology: str) -> GraphArtifacts:
+    return replace(artifacts, topology=topology)
 
 
 def clean(value: Any) -> Any:
@@ -102,23 +106,43 @@ def edge_context_text(graph: nx.DiGraph, src: str, dst: str, data: dict[str, Any
     return f"src={src} [{src_text}] --[{data['edge_type']}]--> dst={dst} [{dst_text}]"
 
 
-def load_artifacts(excel_path: str, topology_path: str, config: LeadGenConfig) -> GraphArtifacts:
+def load_artifacts(
+    excel_path: str,
+    topology_path: str,
+    config: LeadGenConfig,
+    status_callback: Callable[[str], None] | None = None,
+) -> GraphArtifacts:
+    if status_callback:
+        status_callback("Reading topology and graph data...")
     topology = Path(topology_path).read_text(encoding="utf-8")
     graph = build_graph(excel_path, config.node_sheet, config.edge_sheet)
 
+    if status_callback:
+        status_callback("Initializing embedding model...")
     print("Initializing embeddings...")
     encoder = SentenceTransformer(config.embedding_model)
 
     node_names = list(graph.nodes)
+    if status_callback:
+        status_callback(f"Encoding {len(node_names)} nodes...")
     node_texts = [node_context_text(graph, node) for node in node_names]
     node_embs = encoder.encode(node_texts, convert_to_tensor=True)
 
     edges = [(u, v, d) for u, v, d in graph.edges(data=True)]
     edge_embs = None
     if edges:
+        if status_callback:
+            status_callback(f"Encoding {len(edges)} edges...")
         edge_texts = [edge_context_text(graph, u, v, d) for u, v, d in edges]
+
+        for u, v, d in edges:
+            if u == 'Fredrick Chang' or v == 'Fredrick Chang':
+                print("Fredrick Chang:  "+edge_context_text(graph, u, v, d))
+
         edge_embs = encoder.encode(edge_texts, convert_to_tensor=True)
 
+    if status_callback:
+        status_callback("Artifacts ready.")
     print(f"Ready | {graph.number_of_nodes()} nodes, {graph.number_of_edges()} edges")
     return GraphArtifacts(
         graph=graph,
@@ -146,7 +170,7 @@ def match_edge_types(artifacts: GraphArtifacts, debug: bool = False) -> set[str]
     rule_emb = artifacts.encoder.encode(artifacts.topology, convert_to_tensor=True)
     type_embs = artifacts.encoder.encode(edge_types, convert_to_tensor=True)
 
-    hits = util.semantic_search(rule_emb, type_embs, top_k=min(5, len(edge_types)))[0]
+    hits = util.semantic_search(rule_emb, type_embs, top_k=min(3, len(edge_types)))[0]
     matched = {edge_types[hit["corpus_id"]] for hit in hits if hit["score"] > 0.25}
 
     if debug:
@@ -168,6 +192,8 @@ def retrieve_candidates(
     matched_types = match_edge_types(artifacts, config.debug)
 
     for src, _, data in artifacts.edges:
+        if src == 'Fredrick Chang':
+            print(f"DEBUG | edge {src} --[{data['edge_type']}]--> has matched_types={matched_types}")
         if data["edge_type"] in matched_types:
             add(src, config.deterministic_match_bonus)
 
@@ -183,6 +209,8 @@ def retrieve_candidates(
             idx = hit["corpus_id"]
             score = float(hit["score"])
             bonus = config.rule_type_bonus if artifacts.edges[idx][2]["edge_type"] in matched_types else 0.0
+            if artifacts.edges[idx][0] == 'Fredrick Chang':
+                print(f"DEBUG | edge hit {artifacts.edges[idx][0]} --[{artifacts.edges[idx][2]['edge_type']}]--> score={score:.4f} bonus={bonus:.4f}")  
             add(
                 artifacts.edges[idx][0],
                 config.edge_score_weight * config.topology_query_weight * score + bonus,
@@ -247,14 +275,69 @@ def neighbor_summary(graph: nx.DiGraph, nb: str) -> str:
     return "; ".join(f"{k}={v[:100]}" for k, v in items[:3])
 
 
-def prompt_payload(graph: nx.DiGraph, node: str) -> dict[str, Any]:
+def relation_text(src: str, edge_type: Any, dst: str) -> str:
+    label = str(edge_type).strip()
+    key = " ".join(label.replace("_", " ").replace("-", " ").split()).casefold()
+
+    templates = {
+        "asset contributor": "{src} is an asset contributor to {dst}",
+        "business ownership": "{src} has business ownership in {dst}",
+        "business profit": "{src} has business profit linked to {dst}",
+        "father": "{src} is the father of {dst}",
+        "family relationship": "{src} has a family relationship with {dst}",
+        "has account": "{src} has an account relationship with {dst}",
+        "mentions": "{src} is mentioned with {dst}",
+        "mother": "{src} is the mother of {dst}",
+        "parent": "{src} is a parent of {dst}",
+        "revoked": "{src} has a revoked relationship involving {dst}",
+        "sale of business": "{src} is involved in a sale of business related to {dst}",
+        "shared address": "{src} shares an address with {dst}",
+        "shared email": "{src} shares an email with {dst}",
+        "shared phone": "{src} shares a phone number with {dst}",
+        "child": "{src} is a child of {dst}",
+        "transaction": "{src} has a transaction with {dst}",
+        "son": "{src} is the son of {dst}",
+        "daughter": "{src} is the daughter of {dst}",
+        "spouse": "{src} is the spouse of {dst}",
+        "husband": "{src} is the husband of {dst}",
+        "wife": "{src} is the wife of {dst}",
+        "brother": "{src} is the brother of {dst}",
+        "sister": "{src} is the sister of {dst}",
+        "sibling": "{src} is a sibling of {dst}",
+        "owns": "{src} owns {dst}",
+        "owner": "{src} is an owner of {dst}",
+        "shareholder": "{src} is a shareholder of {dst}",
+        "partner": "{src} is a partner of {dst}",
+        "founder": "{src} is the founder of {dst}",
+        "director": "{src} is a director of {dst}",
+        "employee": "{src} is an employee of {dst}",
+        "employer": "{src} is the employer of {dst}",
+        "works at": "{src} works at {dst}",
+        "works for": "{src} works for {dst}",
+        "beneficiary": "{src} is a beneficiary of {dst}",
+        "trustee": "{src} is a trustee of {dst}",
+        "settlor": "{src} is the settlor of {dst}",
+    }
+
+    template = templates.get(key)
+    if template:
+        return template.format(src=src, dst=dst)
+    return f"{src} has a '{label}' relationship to {dst}"
+
+
+def score_context(graph: nx.DiGraph, node: str) -> dict[str, Any]:
     attrs = {str(k): str(v)[:200] for k, v in graph.nodes[node].items() if not pd.isna(v)}
 
     out_rels = []
     for nb in list(graph.neighbors(node))[:8]:
         d = graph[node][nb]
-        rel: dict[str, str] = {"dir": "out", "edge_type": d["edge_type"], "target": nb,
-                                "target_attrs": neighbor_summary(graph, nb)}
+        rel: dict[str, str] = {
+            "dir": "out",
+            "edge_type": d["edge_type"],
+            "target": nb,
+            "target_attrs": neighbor_summary(graph, nb),
+            "relation_text": relation_text(node, d["edge_type"], nb),
+        }
         if d.get("edge_info"):
             rel["edge_info"] = str(d["edge_info"])[:200]
         out_rels.append(rel)
@@ -262,13 +345,130 @@ def prompt_payload(graph: nx.DiGraph, node: str) -> dict[str, Any]:
     in_rels = []
     for parent in list(graph.predecessors(node))[:7]:
         d = graph[parent][node]
-        rel = {"dir": "in", "edge_type": d["edge_type"], "source": parent,
-               "source_attrs": neighbor_summary(graph, parent)}
+        rel = {
+            "dir": "in",
+            "edge_type": d["edge_type"],
+            "source": parent,
+            "source_attrs": neighbor_summary(graph, parent),
+            "relation_text": relation_text(parent, d["edge_type"], node),
+        }
         if d.get("edge_info"):
             rel["edge_info"] = str(d["edge_info"])[:200]
         in_rels.append(rel)
 
     return {"node": node, "attrs": attrs, "relations": out_rels + in_rels}
+
+
+
+def deep_node_context(graph: nx.DiGraph, node: str) -> dict[str, Any]:
+    attrs = {str(k): str(v)[:400] for k, v in graph.nodes[node].items() if not pd.isna(v)}
+
+    out_rels = []
+    for nb in list(graph.neighbors(node))[:15]:
+        d = graph[node][nb]
+        nb_attrs = {str(k): str(v)[:200] for k, v in graph.nodes[nb].items() if not pd.isna(v)}
+        rel: dict[str, Any] = {
+            "dir": "out",
+            "edge_type": d["edge_type"],
+            "target": nb,
+            "target_attrs": nb_attrs,
+            "relation_text": relation_text(node, d["edge_type"], nb),
+        }
+        if d.get("edge_info"):
+            rel["edge_info"] = str(d["edge_info"])[:400]
+        out_rels.append(rel)
+
+    in_rels = []
+    for parent in list(graph.predecessors(node))[:15]:
+        d = graph[parent][node]
+        parent_attrs = {
+            str(k): str(v)[:200] for k, v in graph.nodes[parent].items() if not pd.isna(v)
+        }
+        rel: dict[str, Any] = {
+            "dir": "in",
+            "edge_type": d["edge_type"],
+            "source": parent,
+            "source_attrs": parent_attrs,
+            "relation_text": relation_text(parent, d["edge_type"], node),
+        }
+        if d.get("edge_info"):
+            rel["edge_info"] = str(d["edge_info"])[:400]
+        in_rels.append(rel)
+
+    second_hop = []
+    for nb in list(graph.neighbors(node))[:10]:
+        for nb2 in list(graph.neighbors(nb))[:5]:
+            if nb2 == node:
+                continue
+            d2 = graph[nb][nb2]
+            second_hop.append(
+                {
+                    "path": f"{node} -> {nb} -> {nb2}",
+                    "edge_type": d2["edge_type"],
+                    "relation_text": relation_text(nb, d2["edge_type"], nb2),
+                }
+            )
+
+    return {
+        "node": node,
+        "attrs": attrs,
+        "relations": out_rels + in_rels,
+        "second_hop": second_hop[:20],
+    }
+
+
+def analyze_node(
+    node: str,
+    artifacts: GraphArtifacts,
+    final_goal: str,
+    config: LeadGenConfig,
+    llm: OpenAI,
+    score_reason: str = "",
+) -> dict[str, str]:
+    context = deep_node_context(artifacts.graph, node)
+    context_json = json.dumps(context, ensure_ascii=False, default=str)
+
+    prompt = f"""
+    You are a senior wealth management advisor analyzing a graph-derived client opportunity.
+
+    ### GOAL:
+    {final_goal}
+
+    ### NODE CONTEXT:
+    {context_json}
+
+    ### INITIAL TARGETING REASON:
+    {score_reason}
+
+    Write a professional client briefing using exactly two sections.
+
+    Interpret relation_text as the preferred plain-English description of each relationship.
+    Use edge_type, source, target, and attrs as structured evidence to verify the direction and meaning.
+
+    Insight:
+    - Explain who this person or organization is based on the graph.
+    - Summarize the financial situation, business ownership, cash movement, relationships, and any life-event or liquidity signal visible in the data.
+    - Cite actual evidence from the node context.
+
+    Recommended Action:
+    - Provide 3 to 4 concrete next-step actions.
+    - Each action must be specific to this client and tied to the goal.
+    - Explain why each action fits the evidence.
+
+    Return ONLY JSON:
+    {{"insight": "...", "recommended_action": "..."}}
+    """
+
+    response = llm.chat.completions.create(
+        model=config.llm_model,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2,
+    )
+    result = json.loads(strip_fences(response.choices[0].message.content))
+    return {
+        "insight": result.get("insight", ""),
+        "recommended_action": result.get("recommended_action", ""),
+    }
 
 
 def score_batch(
@@ -278,7 +478,7 @@ def score_batch(
     config: LeadGenConfig,
     llm: OpenAI,
 ) -> list[dict[str, Any]]:
-    payload = [prompt_payload(artifacts.graph, node) for node in nodes]
+    payload = [score_context(artifacts.graph, node) for node in nodes]
 
     prompt = (
         f"""
@@ -295,9 +495,12 @@ def score_batch(
 
         ### RULES FOR SCORING:
         - Score each node 0-100 on how strongly it aligns with the TOPOLOGY RULES.
+        - If the Topology Rules apply to ONLY Person or ONLY Organization, nodes that don't match the type should have LOW scores.
         - Use topology rules AND node/edge data as evidence for your scoring.
-        - You must consider if the Topology Rules apply to ONLY Person or ONLY Organization or BOTH.
+        - Read relation_text first because it gives the plain-English meaning of each edge.
+        - Use edge_type, dir, source, and target as the structured ground truth for validation.
         - For nodes scoring >= {config.score_threshold}, provide a concise reason explaining how this node aligns with the topology rules.
+        - In your reasoning, prefer natural relationship wording such as "A is the father of B" instead of repeating raw JSON field names.
         
 
         ### Return ONLY JSON:

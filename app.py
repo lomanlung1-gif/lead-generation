@@ -13,6 +13,7 @@ from main import (
     load_artifacts,
     retrieve_candidates,
     score_batch,
+    with_topology,
 )
 
 
@@ -97,6 +98,41 @@ st.markdown(
     .stButton > button:focus {
         box-shadow: 0 0 0 0.2rem rgba(15, 107, 69, 0.25);
     }
+    .narrative-card {
+        background: #ffffff;
+        border: 1px solid #e2e8f0;
+        border-radius: 14px;
+        padding: 1.4rem 1.6rem 1.2rem 1.6rem;
+        box-shadow: 0 2px 8px rgba(15,23,42,0.06);
+    }
+    .narrative-title {
+        font-size: 1.05rem;
+        font-weight: 700;
+        padding-bottom: 0.7rem;
+        margin-bottom: 1rem;
+        border-bottom: 1px solid #f1f5f9;
+        color: #0f172a;
+    }
+    .narrative-label {
+        font-size: 0.72rem;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: #0f6b45;
+        margin-top: 1.1rem;
+        margin-bottom: 0.4rem;
+    }
+    .narrative-body {
+        font-size: 0.92rem;
+        color: #374151;
+        line-height: 1.65;
+    }
+    .narrative-empty {
+        font-size: 0.9rem;
+        color: #94a3b8;
+        font-style: italic;
+        padding: 1rem 0;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -135,25 +171,66 @@ def step_badge(state: str) -> str:
     return f'<span class="step-state {css}">{state}</span>'
 
 
-def run_pipeline(goal: str, cfg: LeadGenConfig) -> tuple[list[dict[str, Any]], list[str]]:
+def active_artifacts() -> Any:
     artifacts = st.session_state.artifacts
+    if artifacts is None:
+        return None
+    return with_topology(artifacts, st.session_state.topology_text)
+
+
+def run_pipeline(
+    goal: str,
+    cfg: LeadGenConfig,
+    status_callback: Any | None = None,
+    progress_bar: Any | None = None,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    artifacts = active_artifacts()
     if artifacts is None:
         return [], []
 
+    if status_callback:
+        status_callback("Retrieving candidates from current topology...")
+    if progress_bar:
+        progress_bar.progress(10)
     candidates = retrieve_candidates(artifacts, goal, cfg)
     if not candidates:
+        if status_callback:
+            status_callback("No candidates matched the current topology and goal.")
+        if progress_bar:
+            progress_bar.progress(100)
         return [], []
 
     all_results: list[dict[str, Any]] = []
     batch_size = max(1, cfg.llm_batch_size)
     llm = init_llm_client()
+    total_batches = (len(candidates) + batch_size - 1) // batch_size
 
-    for start in range(0, len(candidates), batch_size):
+    if status_callback:
+        status_callback(f"Scoring {len(candidates)} candidates across {total_batches} batches...")
+    if progress_bar:
+        progress_bar.progress(25)
+
+    for batch_index, start in enumerate(range(0, len(candidates), batch_size), start=1):
         batch = candidates[start : start + batch_size]
+        if status_callback:
+            status_callback(f"Scoring batch {batch_index}/{total_batches} ({len(batch)} nodes)...")
         all_results.extend(score_batch(batch, artifacts, goal, cfg, llm))
+        if progress_bar:
+            progress_bar.progress(min(80, 25 + int(55 * batch_index / max(total_batches, 1))))
 
+    if status_callback:
+        status_callback("Ranking final targets...")
     final_results = dedupe_and_sort(all_results)
+
+    if status_callback:
+        status_callback("Discovering new rules from top targets...")
+    if progress_bar:
+        progress_bar.progress(90)
     new_rules = discover_rules(final_results, artifacts, goal, cfg, llm)
+    if status_callback:
+        status_callback("Run complete.")
+    if progress_bar:
+        progress_bar.progress(100)
     return final_results, new_rules
 
 
@@ -184,14 +261,29 @@ st.markdown(
 )
 st.markdown('<div class="step-hint">Prepare graph + embedding artifacts for querying.</div>', unsafe_allow_html=True)
 with st.container(border=True):
+    st.caption("This can take a while when the embedding model is initialized for the first time.")
     if st.button("Load Graph and Embeddings", use_container_width=True):
         try:
             cfg = LeadGenConfig(debug=False, auto_write_rules=False)
-            with st.spinner("Loading graph and embeddings..."):
-                st.session_state.artifacts = load_artifacts(excel_path, topology_path, cfg)
-            st.session_state.artifacts_ready = True
-            st.session_state.last_loaded_topology = st.session_state.topology_text
-            g = st.session_state.artifacts.graph
+            progress_bar = st.progress(0, text="Starting load...")
+            with st.status("Loading graph and embeddings...", expanded=True) as status:
+                stage_progress = {
+                    "Reading topology and graph data...": 15,
+                    "Initializing embedding model...": 35,
+                    "Artifacts ready.": 100,
+                }
+
+                def report(message: str) -> None:
+                    pct = stage_progress.get(message, 65 if message.startswith("Encoding") else 50)
+                    progress_bar.progress(pct, text=message)
+                    status.write(message)
+
+                st.session_state.artifacts = load_artifacts(excel_path, topology_path, cfg, status_callback=report)
+                st.session_state.artifacts_ready = True
+                st.session_state.last_loaded_topology = st.session_state.topology_text
+                g = st.session_state.artifacts.graph
+                progress_bar.progress(100, text="Graph and embeddings ready.")
+                status.update(label="Graph and embeddings ready", state="complete", expanded=False)
             st.success(f"Ready: {g.number_of_nodes()} nodes, {g.number_of_edges()} edges")
         except Exception as exc:
             st.session_state.last_error = str(exc)
@@ -219,10 +311,12 @@ with st.container(border=True):
             try:
                 Path(topology_path).write_text(editor_value, encoding="utf-8")
                 st.session_state.topology_text = editor_value
-                if st.session_state.artifacts_ready and editor_value != st.session_state.last_loaded_topology:
-                    st.session_state.artifacts_ready = False
-                    st.session_state.artifacts = None
-                    st.info("Topology changed. Please reload graph and embeddings.")
+                st.session_state.targets = []
+                st.session_state.proposed_rules = []
+                st.session_state.node_analysis = {}
+                st.session_state.selected_analysis_node = ""
+                if st.session_state.artifacts_ready:
+                    st.info("Topology saved. Graph and embeddings stay loaded. Re-run step 3 to refresh results.")
                 else:
                     st.success("Topology saved.")
             except Exception as exc:
@@ -243,16 +337,29 @@ st.markdown(
 )
 st.markdown('<div class="step-hint">Execute retrieval + scoring + rule discovery.</div>', unsafe_allow_html=True)
 with st.container(border=True):
+    st.caption("This step runs retrieval, LLM scoring by batch, and rule discovery.")
     if st.button("Run Target List and Discover New Rules", use_container_width=True):
         if not st.session_state.artifacts_ready:
             st.warning("Please load graph and embeddings first.")
         else:
             try:
                 cfg = LeadGenConfig(debug=False, auto_write_rules=False)
-                with st.spinner("Scoring targets and discovering rules..."):
-                    targets, rules = run_pipeline(goal, cfg)
+                progress_bar = st.progress(0, text="Starting run...")
+                with st.status("Running target discovery...", expanded=True) as status:
+                    def report(message: str) -> None:
+                        status.write(message)
+                        progress_bar.progress(progress_bar._value if hasattr(progress_bar, '_value') else 0, text=message)
+
+                    targets, rules = run_pipeline(
+                        goal,
+                        cfg,
+                        status_callback=lambda message: status.write(message),
+                        progress_bar=progress_bar,
+                    )
+                    status.update(label="Target discovery complete", state="complete", expanded=False)
                 st.session_state.targets = targets
                 st.session_state.proposed_rules = rules
+                st.session_state.selected_analysis_node = ""
                 st.success(f"Done: {len(targets)} targets, {len(rules)} proposed rules")
             except Exception as exc:
                 st.session_state.last_error = str(exc)
@@ -266,76 +373,100 @@ st.markdown(
     unsafe_allow_html=True,
 )
 with st.container(border=True):
-    st.markdown("**Target List**")
-    if st.session_state.targets:
-        results_df = pd.DataFrame(st.session_state.targets)
-        if not results_df.empty:
-            results_df = results_df.copy()
-            results_df["score"] = pd.to_numeric(results_df["score"], errors="coerce").fillna(0)
-            results_df["score_pct"] = results_df["score"].clip(lower=0, upper=100)
-            display_cols = [col for col in ["node_name", "score_pct", "score", "reason"] if col in results_df.columns]
-            st.dataframe(
-                results_df[display_cols],
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "score_pct": st.column_config.ProgressColumn(
-                        "Score (0-100)",
-                        min_value=0,
-                        max_value=100,
-                        format="%d",
-                    ),
-                    "score": st.column_config.NumberColumn("Raw Score", format="%.2f"),
-                },
-            )
+    tab1, tab2 = st.tabs(["🎯 Target List", "📋 Client Narrative"])
 
-            st.markdown("**Click Target Name to Generate Insight**")
-            top_rows = results_df[["node_name", "reason"]].head(12).to_dict(orient="records")
-            for item in top_rows:
-                node_name = item.get("node_name", "")
-                if not node_name:
-                    continue
-                btn_key = f"analyze_{node_name}"
-                if st.button(f"Analyze: {node_name}", key=btn_key, use_container_width=True):
-                    if not st.session_state.artifacts_ready or st.session_state.artifacts is None:
-                        st.warning("Please load graph and embeddings first.")
+    with tab1:
+        st.markdown("**Target List**")
+        if st.session_state.targets:
+            results_df = pd.DataFrame(st.session_state.targets)
+            if not results_df.empty:
+                results_df = results_df.copy()
+                results_df["score"] = pd.to_numeric(results_df["score"], errors="coerce").fillna(0)
+                results_df["score_pct"] = results_df["score"].clip(lower=0, upper=100)
+                display_cols = [col for col in ["node_name", "score_pct", "score", "reason"] if col in results_df.columns]
+                selection_event = st.dataframe(
+                    results_df[display_cols],
+                    use_container_width=True,
+                    hide_index=True,
+                    on_select="rerun",
+                    selection_mode="single-row",
+                    height=360,
+                    column_config={
+                        "score_pct": st.column_config.ProgressColumn(
+                            "Score (0-100)",
+                            min_value=0,
+                            max_value=100,
+                            format="%d",
+                        ),
+                        "score": st.column_config.NumberColumn("Raw Score", format="%.2f"),
+                    },
+                )
+
+                selected_rows = selection_event.selection.rows if selection_event else []
+                if selected_rows:
+                    selected_idx = selected_rows[0]
+                    selected_row = results_df.iloc[selected_idx]
+                    selected_node = str(selected_row["node_name"])
+                    st.session_state.selected_analysis_node = selected_node
+                    if selected_node not in st.session_state.node_analysis:
+                        runtime_artifacts = active_artifacts()
+                        if not st.session_state.artifacts_ready or runtime_artifacts is None:
+                            st.warning("Please load graph and embeddings first.")
+                        else:
+                            try:
+                                llm = init_llm_client()
+                                cfg = LeadGenConfig(debug=False, auto_write_rules=False)
+                                with st.spinner(f"Analyzing {selected_node}..."):
+                                    analysis = analyze_node(
+                                        node=selected_node,
+                                        artifacts=runtime_artifacts,
+                                        final_goal=goal,
+                                        config=cfg,
+                                        llm=llm,
+                                        score_reason=str(selected_row.get("reason", "")),
+                                    )
+                                st.session_state.node_analysis[selected_node] = analysis
+                                st.info("Analysis ready — open the **Client Narrative** tab.")
+                            except Exception as exc:
+                                st.session_state.last_error = str(exc)
+                                st.error(f"Analysis failed: {exc}")
                     else:
-                        try:
-                            llm = init_llm_client()
-                            cfg = LeadGenConfig(debug=False, auto_write_rules=False)
-                            with st.spinner(f"Analyzing {node_name}..."):
-                                analysis = analyze_node(
-                                    node=node_name,
-                                    artifacts=st.session_state.artifacts,
-                                    final_goal=goal,
-                                    config=cfg,
-                                    llm=llm,
-                                    score_reason=str(item.get("reason", "")),
-                                )
-                            st.session_state.node_analysis[node_name] = analysis
-                            st.session_state.selected_analysis_node = node_name
-                        except Exception as exc:
-                            st.session_state.last_error = str(exc)
-                            st.error(f"Analysis failed: {exc}")
+                        st.info("Analysis ready — open the **Client Narrative** tab.")
+                else:
+                    st.caption("Select a target row to generate client insight and recommended action.")
+        else:
+            st.caption("Target list will appear here after step 3.")
 
-            selected = st.session_state.selected_analysis_node
-            if selected and selected in st.session_state.node_analysis:
-                detail = st.session_state.node_analysis[selected]
-                st.markdown("---")
-                st.markdown(f"### Client Narrative: {selected}")
-                st.markdown("**Insight**")
-                st.write(detail.get("insight", ""))
-                st.markdown("**Recommended Action**")
-                st.write(detail.get("recommended_action", ""))
-    else:
-        st.caption("Target list will appear here after step 3.")
+        st.markdown("**Proposed New Rules**")
+        if st.session_state.proposed_rules:
+            for idx, rule in enumerate(st.session_state.proposed_rules, start=1):
+                st.write(f"{idx}. {rule}")
+        else:
+            st.caption("Proposed rules will appear here after step 3.")
 
-    st.markdown("**Proposed New Rules**")
-    if st.session_state.proposed_rules:
-        for idx, rule in enumerate(st.session_state.proposed_rules, start=1):
-            st.write(f"{idx}. {rule}")
-    else:
-        st.caption("Proposed rules will appear here after step 3.")
+    with tab2:
+        selected = st.session_state.selected_analysis_node
+        if selected and selected in st.session_state.node_analysis:
+            detail = st.session_state.node_analysis[selected]
+            insight = detail.get("insight", "").replace("\n", "<br>")
+            action = detail.get("recommended_action", "").replace("\n", "<br>")
+            st.markdown(
+                f'<div class="narrative-card">'
+                f'<div class="narrative-title">Client Narrative: {selected}</div>'
+                f'<div class="narrative-label">Insight</div>'
+                f'<div class="narrative-body">{insight}</div>'
+                f'<div class="narrative-label">Recommended Action</div>'
+                f'<div class="narrative-body">{action}</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                '<div class="narrative-card">'
+                '<div class="narrative-empty">Select a target from the Target List tab to generate a detailed insight and recommended action.</div>'
+                '</div>',
+                unsafe_allow_html=True,
+            )
 
 if st.session_state.last_error:
     st.divider()
