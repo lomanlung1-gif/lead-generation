@@ -19,20 +19,20 @@ load_dotenv(ROOT / ".env")
 class LeadGenConfig:
     node_sheet: str = "Node"
     edge_sheet: str = "Edge"
-    embedding_model: str = "all-MiniLM-L6-v2"
+    embedding_model: str = "BAAI/bge-small-en-v1.5"
     retrieval_k: int = 50
-    candidate_pool_size: int = 120
+    candidate_pool_size: int = 50
     topology_query_weight: float = 0.7
     goal_query_weight: float = 0.3
     edge_score_weight: float = 0.7
     node_score_weight: float = 0.3
     rule_type_bonus: float = 0.35
     deterministic_match_bonus: float = 0.6
-    score_threshold: int = 20
-    llm_batch_size: int = 20
+    score_threshold: int = 60
+    llm_batch_size: int = 10
     auto_write_rules: bool = False
     debug: bool = False
-    llm_model: str = "deepseek-chat"
+    llm_model: str = "deepseek-reasoner"
 
 
 @dataclass(frozen=True)
@@ -75,19 +75,20 @@ def build_graph(excel_path: str, node_sheet: str, edge_sheet: str) -> nx.DiGraph
 
 def node_context_text(graph: nx.DiGraph, node: str) -> str:
     attrs = graph.nodes[node]
-    attr_text = "; ".join(f"{k}={v}" for k, v in attrs.items() if not pd.isna(v))[:450]
+    attr_text = "; ".join(f"{k}={v}" for k, v in attrs.items() if not pd.isna(v))[:600]
 
     out_edges = [graph[node][nb]["edge_type"] for nb in graph.neighbors(node)]
     in_edges = [graph[parent][node]["edge_type"] for parent in graph.predecessors(node)]
 
-    out_top = ", ".join(sorted(set(out_edges))[:8])
-    in_top = ", ".join(sorted(set(in_edges))[:8])
-    neighbors = ", ".join(list(graph.neighbors(node))[:5])
+    out_top = ", ".join(sorted(set(out_edges))[:10])
+    in_top = ", ".join(sorted(set(in_edges))[:10])
+    out_neighbors = ", ".join(list(graph.neighbors(node))[:6])
+    in_neighbors = ", ".join(list(graph.predecessors(node))[:6])
 
     return (
         f"node={node} | attrs={attr_text} | "
         f"out_edge_types={out_top} | in_edge_types={in_top} | "
-        f"neighbors={neighbors}"
+        f"out_neighbors={out_neighbors} | in_neighbors={in_neighbors}"
     )
 
 
@@ -95,8 +96,8 @@ def edge_context_text(graph: nx.DiGraph, src: str, dst: str, data: dict[str, Any
     src_attrs = graph.nodes[src]
     dst_attrs = graph.nodes[dst]
 
-    src_text = "; ".join(f"{k}={v}" for k, v in src_attrs.items() if not pd.isna(v))[:220]
-    dst_text = "; ".join(f"{k}={v}" for k, v in dst_attrs.items() if not pd.isna(v))[:220]
+    src_text = "; ".join(f"{k}={v}" for k, v in src_attrs.items() if not pd.isna(v))[:300]
+    dst_text = "; ".join(f"{k}={v}" for k, v in dst_attrs.items() if not pd.isna(v))[:300]
 
     return f"src={src} [{src_text}] --[{data['edge_type']}]--> dst={dst} [{dst_text}]"
 
@@ -241,10 +242,33 @@ def strip_fences(text: str) -> str:
     return stripped
 
 
-def node_payload(graph: nx.DiGraph, node: str) -> dict[str, Any]:
+def neighbor_summary(graph: nx.DiGraph, nb: str) -> str:
+    items = [(str(k), str(v)) for k, v in graph.nodes[nb].items() if not pd.isna(v)]
+    return "; ".join(f"{k}={v[:100]}" for k, v in items[:3])
+
+
+def prompt_payload(graph: nx.DiGraph, node: str) -> dict[str, Any]:
     attrs = {str(k): str(v)[:200] for k, v in graph.nodes[node].items() if not pd.isna(v)}
-    rels = [f"--[{graph[node][nb]['edge_type']}]--> {nb}" for nb in graph.neighbors(node)][:15]
-    return {"node": node, "attrs": attrs, "relations": rels}
+
+    out_rels = []
+    for nb in list(graph.neighbors(node))[:8]:
+        d = graph[node][nb]
+        rel: dict[str, str] = {"dir": "out", "edge_type": d["edge_type"], "target": nb,
+                                "target_attrs": neighbor_summary(graph, nb)}
+        if d.get("edge_info"):
+            rel["edge_info"] = str(d["edge_info"])[:200]
+        out_rels.append(rel)
+
+    in_rels = []
+    for parent in list(graph.predecessors(node))[:7]:
+        d = graph[parent][node]
+        rel = {"dir": "in", "edge_type": d["edge_type"], "source": parent,
+               "source_attrs": neighbor_summary(graph, parent)}
+        if d.get("edge_info"):
+            rel["edge_info"] = str(d["edge_info"])[:200]
+        in_rels.append(rel)
+
+    return {"node": node, "attrs": attrs, "relations": out_rels + in_rels}
 
 
 def score_batch(
@@ -253,20 +277,32 @@ def score_batch(
     final_goal: str,
     config: LeadGenConfig,
     llm: OpenAI,
-) -> tuple[list[dict[str, Any]], list[str]]:
-    payload = [node_payload(artifacts.graph, node) for node in nodes]
+) -> list[dict[str, Any]]:
+    payload = [prompt_payload(artifacts.graph, node) for node in nodes]
 
     prompt = (
-        "You are a lead-scoring analyst for financial services.\n\n"
-        f"GOAL: {final_goal}\n\n"
-        f"TOPOLOGY RULES (apply strictly):\n{artifacts.topology}\n\n"
-        f"NODES:\n{json.dumps(payload, ensure_ascii=False, default=str)}\n\n"
-        "Score each node 0-100 based on topology rules and data only.\n"
-        f"For nodes >= {config.score_threshold}, give a concise reason.\n"
-        "Also list any new topology rules you can confidently derive.\n\n"
-        "Return ONLY JSON:\n"
-        '{"targets": [{"node_name": "...", "score": N, "reason": "..."}], '
-        '"new_discovered_rules": ["..."]}'
+        f"""
+        Your task is to evaluate how well each node in the provided list of candidates aligns with the TOPOLOGY RULES and contributes to achieving the GOAL.
+        
+        ### GOAL:
+        {final_goal}
+        
+        ### TOPOLOGY RULES (primary optimization target):
+        {artifacts.topology}
+
+        ### NODES:
+        {json.dumps(payload, ensure_ascii=False, default=str)}
+
+        ### RULES FOR SCORING:
+        - Score each node 0-100 on how strongly it aligns with the TOPOLOGY RULES.
+        - Use topology rules AND node/edge data as evidence for your scoring.
+        - You must consider if the Topology Rules apply to ONLY Person or ONLY Organization or BOTH.
+        - For nodes scoring >= {config.score_threshold}, provide a concise reason explaining how this node aligns with the topology rules.
+        
+
+        ### Return ONLY JSON:
+        {{"targets": [{{"node_name": "...", "score": N, "reason": "..."}}]}}
+        """
     )
 
     try:
@@ -279,9 +315,9 @@ def score_batch(
     except Exception as exc:
         if "context length" in str(exc).lower() and len(nodes) > 1:
             mid = len(nodes) // 2
-            left_targets, left_rules = score_batch(nodes[:mid], artifacts, final_goal, config, llm)
-            right_targets, right_rules = score_batch(nodes[mid:], artifacts, final_goal, config, llm)
-            return left_targets + right_targets, left_rules + right_rules
+            left = score_batch(nodes[:mid], artifacts, final_goal, config, llm)
+            right = score_batch(nodes[mid:], artifacts, final_goal, config, llm)
+            return left + right
         raise
 
     valid_nodes = set(nodes)
@@ -291,13 +327,12 @@ def score_batch(
         if target.get("node_name") in valid_nodes
         and target.get("score", 0) >= config.score_threshold
     ]
-    rules = result.get("new_discovered_rules", [])
 
     if config.debug:
         raw = result.get("targets", [])
         print(f"DEBUG | batch={len(nodes)} returned={len(raw)} kept={len(targets)}")
 
-    return targets, rules
+    return targets
 
 
 def dedupe_and_sort(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -311,6 +346,77 @@ def dedupe_and_sort(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
             best_by_name[name] = result
 
     return sorted(best_by_name.values(), key=lambda item: item["score"], reverse=True)
+
+
+def graph_stats(artifacts: GraphArtifacts) -> str:
+    from collections import Counter
+    edge_counts = Counter(d["edge_type"] for _, _, d in artifacts.edges)
+    return "; ".join(f"{etype}({count})" for etype, count in edge_counts.most_common(15))
+
+
+def discover_rules(
+    scored_targets: list[dict[str, Any]],
+    artifacts: GraphArtifacts,
+    final_goal: str,
+    config: LeadGenConfig,
+    llm: OpenAI,
+) -> list[str]:
+    top_evidence = scored_targets[:30]
+    if not top_evidence:
+        return []
+
+    evidence_text = json.dumps(top_evidence, ensure_ascii=False, default=str)
+    stats = graph_stats(artifacts)
+    existing_edge_types = sorted({d["edge_type"] for _, _, d in artifacts.edges})
+
+    prompt = (
+        "You are a topology-rule analyst for financial services.\n\n"
+        f"GOAL (optimize all rules for this): {final_goal}\n\n"
+        f"EXISTING RULES (do NOT repeat these):\n{artifacts.topology}\n\n"
+        f"GRAPH EDGE TYPES & FREQUENCIES: {stats}\n\n"
+        f"HIGH-SCORING NODES (evidence):\n{evidence_text}\n\n"
+        "Discover NEW graph-topology rules that predict which nodes are most "
+        "valuable for achieving the GOAL above.\n\n"
+        "Requirements for each rule:\n"
+        "- Must explain a specific edge pattern (e.g., 'A --[edge_type]--> B means ...')\n"
+        "- Must cite at least 2 node names from the evidence as support\n"
+        "- Must explain WHY this pattern indicates the node can help achieve the GOAL\n"
+        "- Must use only edge types that exist: " + json.dumps(existing_edge_types) + "\n"
+        "- Do NOT restate existing rules in any form\n\n"
+        "Return ONLY JSON:\n"
+        '{"rules": [{"rule": "...", "supporting_nodes": ["node1", "node2"], '
+        '"edge_type": "..."}]}'
+    )
+
+    try:
+        response = llm.chat.completions.create(
+            model=config.llm_model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+        )
+        result = json.loads(strip_fences(response.choices[0].message.content))
+    except Exception as exc:
+        if config.debug:
+            print(f"DEBUG | rule discovery failed: {exc}")
+        return []
+
+    valid_edge_types = set(existing_edge_types)
+    validated = []
+    for entry in result.get("rules", []):
+        rule_text = entry.get("rule", "")
+        cited_type = entry.get("edge_type", "")
+        if not rule_text:
+            continue
+        if cited_type and cited_type not in valid_edge_types:
+            if config.debug:
+                print(f"DEBUG | rejected rule (bad edge_type={cited_type}): {rule_text}")
+            continue
+        validated.append(rule_text)
+
+    if config.debug:
+        print(f"DEBUG | rules proposed={len(result.get('rules', []))} validated={len(validated)}")
+
+    return validated
 
 
 def append_rules(topology_path: str, rules: list[str]) -> int:
@@ -343,36 +449,37 @@ def generate_targets(
 
     print(f"Scoring {len(candidates)} candidates...")
     all_results: list[dict[str, Any]] = []
-    all_rules: list[str] = []
     batch_size = max(1, cfg.llm_batch_size)
 
     try:
         for start in range(0, len(candidates), batch_size):
             batch = candidates[start : start + batch_size]
-            targets, rules = score_batch(batch, artifacts, final_goal, cfg, llm)
+            targets = score_batch(batch, artifacts, final_goal, cfg, llm)
             all_results.extend(targets)
-            all_rules.extend(rules)
     except Exception as exc:
         print(f"LLM error: {exc}")
         return []
 
     final_results = dedupe_and_sort(all_results)
 
-    if cfg.auto_write_rules and all_rules:
-        unique_rules = list(dict.fromkeys(all_rules))
-        append_rules(topology_path, unique_rules)
+    if cfg.auto_write_rules:
+        print("Discovering topology rules...")
+        new_rules = discover_rules(final_results, artifacts, final_goal, cfg, llm)
+        if new_rules:
+            append_rules(topology_path, new_rules)
 
     return final_results
 
 
 if __name__ == "__main__":
-    config = LeadGenConfig(debug=True, auto_write_rules=False)
+    config = LeadGenConfig(debug=True, auto_write_rules=True)
 
     targets = generate_targets(
         excel_path="COI_Template.xlsx",
         final_goal="Increase financial product sales revenue by identifying high-value prospective clients",
         topology_path="topology.md",
-        config=config,
+        config=config
+        
     )
 
     print("\n=== High-Priority Target List ===")

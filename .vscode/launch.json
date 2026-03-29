@@ -12,16 +12,7 @@
       "justMyCode": true,
       "subProcess": false,
       "envFile": "${workspaceFolder}/.secrets/deepseek.env"
-    },
-    {
-      "name": "Python: Attach 5678 (Lead Generation)",
-      "type": "debugpy",
-      "request": "attach",
-      "connect": {
-        "host": "127.0.0.1",
-        "port": 5678
-      },
-      "justMyCode": true
     }
+
   ]
 }
