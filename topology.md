@@ -1,3 +1,3 @@
 ## Initial Experience Rules
 
-- Person retires from a key decision making role, e.g. CEO.
+- Person who retired from a key position, i.e. CEO

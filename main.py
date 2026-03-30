@@ -382,11 +382,33 @@ def deep_node_context(graph: nx.DiGraph, node: str) -> dict[str, Any]:
                 }
             )
 
+    third_hop = []
+    visited_2hop = {(nb, nb2) for item in second_hop for nb, nb2 in [(item["path"].split(" -> ")[1], item["path"].split(" -> ")[2])]}
+    for nb in list(graph.neighbors(node))[:8]:
+        for nb2 in list(graph.neighbors(nb))[:4]:
+            if nb2 == node:
+                continue
+            for nb3 in list(graph.neighbors(nb2))[:3]:
+                if nb3 == node or nb3 == nb:
+                    continue
+                d3 = graph[nb2][nb3]
+                third_hop.append(
+                    {
+                        "path": f"{node} -> {nb} -> {nb2} -> {nb3}",
+                        "hops": [
+                            relation_text(node, graph[node][nb]["edge_type"], nb),
+                            relation_text(nb, graph[nb][nb2]["edge_type"], nb2),
+                            relation_text(nb2, d3["edge_type"], nb3),
+                        ],
+                    }
+                )
+
     return {
         "node": node,
         "attrs": attrs,
         "relations": out_rels + in_rels,
         "second_hop": second_hop[:20],
+        "third_hop": third_hop[:15],
     }
 
 
@@ -402,7 +424,7 @@ def analyze_node(
     context_json = json.dumps(context, ensure_ascii=False, default=str)
 
     prompt = f"""
-    You are a senior wealth management advisor analyzing a graph-derived client opportunity.
+    You are a senior wealth management advisor writing a client briefing from graph data.
 
     ### GOAL:
     {final_goal}
@@ -413,23 +435,17 @@ def analyze_node(
     ### INITIAL TARGETING REASON:
     {score_reason}
 
-    Write a professional client briefing using exactly two sections.
+    ### WRITING RULES:
+    - Use ONLY plain English. Never output JSON field names like edge_type, dir, target_attrs.
+    - When describing relationships, trace complete chains: e.g. "John is the father of Alice, who owns Acme Corp, which received a $2M transaction from Beta LLC."
+    - The "hops" array in third_hop gives you the plain-English chain — stitch those sentences together into a single narrative thread.
+    - Every claim must cite a specific name, amount, or relationship from the data.
 
-    Interpret relation_text as the preferred plain-English description of each relationship.
-    Use edge_type, source, target, and attrs as structured evidence to verify the direction and meaning.
-
-    Insight:
-    - Explain who this person or organization is based on the graph.
-    - Summarize the financial situation, business ownership, cash movement, relationships, and any life-event or liquidity signal visible in the data.
-    - Cite actual evidence from the node context.
-
-    Recommended Action:
-    - Provide 3 to 4 concrete next-step actions.
-    - Each action must be specific to this client and tied to the goal.
-    - Explain why each action fits the evidence.
-
-    Return ONLY JSON:
-    {{"insight": "...", "recommended_action": "..."}}
+    ### OUTPUT FORMAT (return ONLY this JSON):
+    {{{{
+      "insight": "<Client Profile>\n<paragraph: who this person/org is, their role, type, and key attributes>\n\n<Key Relationships>\n<paragraph: trace the most important 1-hop, 2-hop, and 3-hop relationship chains as connected narratives, not isolated bullet points. Explain how each chain connects back to this client.>\n\n<Financial Signals & Life Events>\n<paragraph: ownership stakes, transactions, liquidity events, account activity, or life changes visible in the data. Cite amounts, dates, or edge details when available.>",
+      "recommended_action": "1. <Specific action> — Evidence: <cite the exact relationship chain or data point> — Rationale: <why this action fits the goal>\n2. <Specific action> — Evidence: <cite> — Rationale: <why>\n3. <Specific action> — Evidence: <cite> — Rationale: <why>"
+    }}}}
     """
 
     response = llm.chat.completions.create(
