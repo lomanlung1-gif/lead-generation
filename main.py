@@ -8,11 +8,38 @@ import networkx as nx
 import pandas as pd
 from dotenv import load_dotenv
 from openai import OpenAI
-from sentence_transformers import SentenceTransformer, util
+from sentence_transformers import SentenceTransformer
+from sentence_transformers.cross_encoder import CrossEncoder
 
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".secrets" / "deepseek.env")
 load_dotenv(ROOT / ".env")
+
+
+_cross_encoder_model: CrossEncoder | None = None
+
+
+def get_cross_encoder() -> CrossEncoder:
+    global _cross_encoder_model
+    if _cross_encoder_model is None:
+        _cross_encoder_model = CrossEncoder("cross-encoder/ms-marco-MiniLM-L6-v2")
+    return _cross_encoder_model
+
+
+def cross_semantic_search(query_text: str, corpus_texts: list[str], top_k: int) -> list[dict[str, float]]:
+    if not corpus_texts or top_k <= 0:
+        return []
+
+    model = get_cross_encoder()
+    pairs = [[query_text, text] for text in corpus_texts]
+    scores = model.predict(pairs)
+
+    ranked = sorted(
+        ((idx, float(score)) for idx, score in enumerate(scores)),
+        key=lambda item: item[1],
+        reverse=True,
+    )[: min(top_k, len(corpus_texts))]
+    return [{"corpus_id": idx, "score": score} for idx, score in ranked]
 
 
 @dataclass(frozen=True)
@@ -22,8 +49,6 @@ class LeadGenConfig:
     embedding_model: str = "BAAI/bge-small-en-v1.5"
     retrieval_k: int = 50
     candidate_pool_size: int = 50
-    topology_query_weight: float = 0.7
-    goal_query_weight: float = 0.3
     edge_score_weight: float = 0.7
     node_score_weight: float = 0.3
     rule_type_bonus: float = 0.35
@@ -167,11 +192,8 @@ def match_edge_types(artifacts: GraphArtifacts, debug: bool = False) -> set[str]
     if not edge_types:
         return set()
 
-    rule_emb = artifacts.encoder.encode(artifacts.topology, convert_to_tensor=True)
-    type_embs = artifacts.encoder.encode(edge_types, convert_to_tensor=True)
-
-    hits = util.semantic_search(rule_emb, type_embs, top_k=min(3, len(edge_types)))[0]
-    matched = {edge_types[hit["corpus_id"]] for hit in hits if hit["score"] > 0.25}
+    hits = cross_semantic_search(artifacts.topology, edge_types, top_k=min(3, len(edge_types)))
+    matched = {edge_types[hit["corpus_id"]] for hit in hits }
 
     if debug:
         print(f"DEBUG | matched_edge_types={matched}")
@@ -186,69 +208,35 @@ def retrieve_candidates(
 ) -> list[str]:
     candidate_scores: dict[str, float] = {}
 
-    def add(name: str, score: float) -> None:
-        candidate_scores[name] = candidate_scores.get(name, 0.0) + score
+    def get_max(name: str, score: float) -> None:
+        candidate_scores[name] = max(candidate_scores.get(name, -99), score)
 
-    matched_types = match_edge_types(artifacts, config.debug)
 
-    for src, _, data in artifacts.edges:
-        if src == 'Fredrick Chang':
-            print(f"DEBUG | edge {src} --[{data['edge_type']}]--> has matched_types={matched_types}")
-        if data["edge_type"] in matched_types:
-            add(src, config.deterministic_match_bonus)
+    edge_texts = [edge_context_text(artifacts.graph, u, v, d) for u, v, d in artifacts.edges]
+    node_texts = [node_context_text(artifacts.graph, node) for node in artifacts.node_names]
 
-    topology_q = artifacts.encoder.encode(artifacts.topology, convert_to_tensor=True)
-    goal_q = artifacts.encoder.encode(final_goal, convert_to_tensor=True)
-
-    if artifacts.edge_embs is not None:
+    if edge_texts:
         edge_k = min(config.retrieval_k, len(artifacts.edges))
-        edge_hits_topology = util.semantic_search(topology_q, artifacts.edge_embs, top_k=edge_k)[0]
-        edge_hits_goal = util.semantic_search(goal_q, artifacts.edge_embs, top_k=edge_k)[0]
+        edge_hits_topology = cross_semantic_search(artifacts.topology, edge_texts, top_k=edge_k)
 
         for hit in edge_hits_topology:
             idx = hit["corpus_id"]
             score = float(hit["score"])
-            bonus = config.rule_type_bonus if artifacts.edges[idx][2]["edge_type"] in matched_types else 0.0
-            if artifacts.edges[idx][0] == 'Fredrick Chang':
-                print(f"DEBUG | edge hit {artifacts.edges[idx][0]} --[{artifacts.edges[idx][2]['edge_type']}]--> score={score:.4f} bonus={bonus:.4f}")  
-            add(
-                artifacts.edges[idx][0],
-                config.edge_score_weight * config.topology_query_weight * score + bonus,
-            )
-
-        for hit in edge_hits_goal:
-            idx = hit["corpus_id"]
-            score = float(hit["score"])
-            add(
-                artifacts.edges[idx][0],
-                config.edge_score_weight * config.goal_query_weight * score,
-            )
+            get_max( artifacts.edges[idx][0], score)
+            get_max( artifacts.edges[idx][1], score)
 
     node_k = min(config.retrieval_k, len(artifacts.node_names))
-    node_hits_topology = util.semantic_search(topology_q, artifacts.node_embs, top_k=node_k)[0]
-    node_hits_goal = util.semantic_search(goal_q, artifacts.node_embs, top_k=node_k)[0]
+    node_hits_topology = cross_semantic_search(artifacts.topology, node_texts, top_k=node_k)
 
     for hit in node_hits_topology:
         idx = hit["corpus_id"]
         score = float(hit["score"])
-        add(
-            artifacts.node_names[idx],
-            config.node_score_weight * config.topology_query_weight * score,
-        )
-
-    for hit in node_hits_goal:
-        idx = hit["corpus_id"]
-        score = float(hit["score"])
-        add(
-            artifacts.node_names[idx],
-            config.node_score_weight * config.goal_query_weight * score,
-        )
+        get_max(artifacts.node_names[idx], score)
 
     ranked = sorted(candidate_scores.items(), key=lambda item: item[1], reverse=True)
     candidates = [name for name, _ in ranked[: config.candidate_pool_size]]
 
     if config.debug:
-        print(f"DEBUG | matched_edge_types={matched_types}")
         print(
             "DEBUG | "
             f"scored_candidates={len(candidate_scores)} "
@@ -495,7 +483,7 @@ def score_batch(
 
         ### RULES FOR SCORING:
         - Score each node 0-100 on how strongly it aligns with the TOPOLOGY RULES.
-        - If the Topology Rules apply to ONLY Person or ONLY Organization, nodes that don't match the type should have LOW scores.
+        - If Topology Rules apply to Person/Individual ONLY but the node is Organization/other types -> 0 score. 
         - Use topology rules AND node/edge data as evidence for your scoring.
         - Read relation_text first because it gives the plain-English meaning of each edge.
         - Use edge_type, dir, source, and target as the structured ground truth for validation.
@@ -675,7 +663,7 @@ def generate_targets(
 
 
 if __name__ == "__main__":
-    config = LeadGenConfig(debug=True, auto_write_rules=True)
+    config = LeadGenConfig(debug=True, auto_write_rules=False)
 
     targets = generate_targets(
         excel_path="COI_Template.xlsx",
