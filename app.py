@@ -144,6 +144,21 @@ st.markdown(
 )
 
 
+def topology_options(topology_text: str) -> list[str]:
+    lines = topology_text.splitlines()
+    options = [line.strip()[2:].strip() for line in lines if line.strip().startswith("-")]
+    if not options:
+        options = [line.strip() for line in lines if line.strip() and not line.strip().startswith("#")]
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for option in options:
+        if option and option not in seen:
+            deduped.append(option)
+            seen.add(option)
+    return deduped
+
+
 def ensure_state() -> None:
     if "artifacts" not in st.session_state:
         st.session_state.artifacts = None
@@ -164,6 +179,8 @@ def ensure_state() -> None:
         st.session_state.node_analysis = {}
     if "selected_analysis_node" not in st.session_state:
         st.session_state.selected_analysis_node = ""
+    if "selected_topologies" not in st.session_state:
+        st.session_state.selected_topologies = topology_options(st.session_state.topology_text)
 
 
 def step_badge(state: str) -> str:
@@ -175,7 +192,9 @@ def active_artifacts() -> Any:
     artifacts = st.session_state.artifacts
     if artifacts is None:
         return None
-    return with_topology(artifacts, st.session_state.topology_text)
+    selected = st.session_state.selected_topologies
+    selected_topology_text = "\n".join(f"- {rule}" for rule in selected)
+    return with_topology(artifacts, selected_topology_text)
 
 
 def run_pipeline(
@@ -189,7 +208,7 @@ def run_pipeline(
         return [], []
 
     if status_callback:
-        status_callback("Retrieving candidates from current topology...")
+        status_callback("Retrieving candidates from selected topology rules...")
     if progress_bar:
         progress_bar.progress(10)
     candidates = retrieve_candidates(artifacts, goal, cfg)
@@ -305,12 +324,26 @@ with st.container(border=True):
         label_visibility="collapsed",
     )
 
+    options = topology_options(editor_value)
+    current_selected = [rule for rule in st.session_state.selected_topologies if rule in options]
+    if not current_selected and options:
+        current_selected = options
+    st.session_state.selected_topologies = st.multiselect(
+        "Select topologies for retrieval",
+        options=options,
+        default=current_selected,
+        help="Only selected topology rules are used during retrieval and scoring.",
+    )
+
     save_col, state_col = st.columns([1, 2])
     with save_col:
         if st.button("Save Topology", use_container_width=True):
             try:
                 Path(topology_path).write_text(editor_value, encoding="utf-8")
                 st.session_state.topology_text = editor_value
+                new_options = topology_options(editor_value)
+                kept = [rule for rule in st.session_state.selected_topologies if rule in new_options]
+                st.session_state.selected_topologies = kept if kept else new_options
                 st.session_state.targets = []
                 st.session_state.proposed_rules = []
                 st.session_state.node_analysis = {}
@@ -337,7 +370,10 @@ st.markdown(
 )
 st.markdown('<div class="step-hint">Execute retrieval + scoring + rule discovery.</div>', unsafe_allow_html=True)
 with st.container(border=True):
-    st.caption("This step runs retrieval, LLM scoring by batch, and rule discovery.")
+    selected_count = len(st.session_state.selected_topologies)
+    st.caption(
+        f"This step runs retrieval, LLM scoring by batch, and rule discovery using {selected_count} selected topology rule(s)."
+    )
     if st.button("Run Target List and Discover New Rules", use_container_width=True):
         if not st.session_state.artifacts_ready:
             st.warning("Please load graph and embeddings first.")
