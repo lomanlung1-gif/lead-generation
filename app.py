@@ -170,8 +170,6 @@ def ensure_state() -> None:
         st.session_state.proposed_rules = []
     if "last_error" not in st.session_state:
         st.session_state.last_error = ""
-    if "last_loaded_topology" not in st.session_state:
-        st.session_state.last_loaded_topology = ""
     if "topology_text" not in st.session_state:
         topo_path = Path(DEFAULT_TOPOLOGY_PATH)
         st.session_state.topology_text = topo_path.read_text(encoding="utf-8") if topo_path.exists() else ""
@@ -211,7 +209,7 @@ def run_pipeline(
         status_callback("Retrieving candidates from selected topology rules...")
     if progress_bar:
         progress_bar.progress(10)
-    candidates = retrieve_candidates(artifacts, goal, cfg)
+    candidates = retrieve_candidates(artifacts, cfg)
     if not candidates:
         if status_callback:
             status_callback("No candidates matched the current topology and goal.")
@@ -299,7 +297,6 @@ with st.container(border=True):
 
                 st.session_state.artifacts = load_artifacts(excel_path, topology_path, cfg, status_callback=report)
                 st.session_state.artifacts_ready = True
-                st.session_state.last_loaded_topology = st.session_state.topology_text
                 g = st.session_state.artifacts.graph
                 progress_bar.progress(100, text="Graph and embeddings ready.")
                 status.update(label="Graph and embeddings ready", state="complete", expanded=False)
@@ -382,10 +379,6 @@ with st.container(border=True):
                 cfg = LeadGenConfig(debug=False, auto_write_rules=False)
                 progress_bar = st.progress(0, text="Starting run...")
                 with st.status("Running target discovery...", expanded=True) as status:
-                    def report(message: str) -> None:
-                        status.write(message)
-                        progress_bar.progress(progress_bar._value if hasattr(progress_bar, '_value') else 0, text=message)
-
                     targets, rules = run_pipeline(
                         goal,
                         cfg,

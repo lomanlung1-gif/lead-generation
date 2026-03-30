@@ -187,23 +187,8 @@ def init_llm_client() -> OpenAI:
     return OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
 
 
-def match_edge_types(artifacts: GraphArtifacts, debug: bool = False) -> set[str]:
-    edge_types = sorted({data["edge_type"] for _, _, data in artifacts.edges})
-    if not edge_types:
-        return set()
-
-    hits = cross_semantic_search(artifacts.topology, edge_types, top_k=min(3, len(edge_types)))
-    matched = {edge_types[hit["corpus_id"]] for hit in hits }
-
-    if debug:
-        print(f"DEBUG | matched_edge_types={matched}")
-
-    return matched
-
-
 def retrieve_candidates(
     artifacts: GraphArtifacts,
-    final_goal: str,
     config: LeadGenConfig,
 ) -> list[str]:
     candidate_scores: dict[str, float] = {}
@@ -634,7 +619,7 @@ def generate_targets(
     artifacts = load_artifacts(excel_path, topology_path, cfg)
     llm = init_llm_client()
 
-    candidates = retrieve_candidates(artifacts, final_goal, cfg)
+    candidates = retrieve_candidates(artifacts, cfg)
     if not candidates:
         return []
 
