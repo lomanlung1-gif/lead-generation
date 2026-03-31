@@ -109,10 +109,10 @@ def node_context_text(graph: nx.DiGraph, node: str) -> str:
     out_edges = [graph[node][nb]["edge_type"] for nb in graph.neighbors(node)]
     in_edges = [graph[parent][node]["edge_type"] for parent in graph.predecessors(node)]
 
-    out_top = ", ".join(sorted(set(out_edges))[:10])
-    in_top = ", ".join(sorted(set(in_edges))[:10])
-    out_neighbors = ", ".join(list(graph.neighbors(node))[:6])
-    in_neighbors = ", ".join(list(graph.predecessors(node))[:6])
+    out_top = ", ".join(sorted(set(out_edges)))
+    in_top = ", ".join(sorted(set(in_edges)))
+    out_neighbors = ", ".join(graph.neighbors(node))
+    in_neighbors = ", ".join(graph.predecessors(node))
 
     return (
         f"node={node} | attrs={attr_text} | "
@@ -159,10 +159,6 @@ def load_artifacts(
         if status_callback:
             status_callback(f"Encoding {len(edges)} edges...")
         edge_texts = [edge_context_text(graph, u, v, d) for u, v, d in edges]
-
-        for u, v, d in edges:
-            if u == 'Fredrick Chang' or v == 'Fredrick Chang':
-                print("Fredrick Chang:  "+edge_context_text(graph, u, v, d))
 
         edge_embs = encoder.encode(edge_texts, convert_to_tensor=True)
 
@@ -302,7 +298,7 @@ def score_context(graph: nx.DiGraph, node: str) -> dict[str, Any]:
     attrs = {str(k): str(v)[:200] for k, v in graph.nodes[node].items() if not pd.isna(v)}
 
     out_rels = []
-    for nb in list(graph.neighbors(node))[:8]:
+    for nb in graph.neighbors(node):
         d = graph[node][nb]
         rel: dict[str, str] = {
             "dir": "out",
@@ -316,7 +312,7 @@ def score_context(graph: nx.DiGraph, node: str) -> dict[str, Any]:
         out_rels.append(rel)
 
     in_rels = []
-    for parent in list(graph.predecessors(node))[:7]:
+    for parent in graph.predecessors(node):
         d = graph[parent][node]
         rel = {
             "dir": "in",
@@ -348,49 +344,63 @@ def _edge_rel(graph: nx.DiGraph, src: str, dst: str) -> dict[str, Any]:
     return rel
 
 
-def deep_node_context(graph: nx.DiGraph, node: str, max_hops: int = 1, fan_out: int = 15) -> dict[str, Any]:
+_HIGH_IMPACT = frozenset({
+    "owner", "owns", "director", "shareholder", "founder", "settlor",
+    "beneficiary", "trustee", "business ownership", "business profit",
+    "asset contributor", "has account", "sale of business",
+    "father", "mother", "spouse", "husband", "wife",
+    "son", "daughter", "sibling", "brother", "sister", "parent", "child", "family relationship",
+})
+
+
+def _edge_priority(edge_type: str) -> int:
+    return 0 if str(edge_type).strip().casefold() in _HIGH_IMPACT else 1
+
+
+def deep_node_context(graph: nx.DiGraph, node: str, max_hops: int = 1) -> dict[str, Any]:
     attrs = _node_attrs(graph, node, limit=400)
+    relations = sorted(
+        [{"dir": "out", "target": nb, "target_attrs": _node_attrs(graph, nb), **_edge_rel(graph, node, nb)}
+         for nb in graph.neighbors(node)]
+        + [{"dir": "in", "source": p, "source_attrs": _node_attrs(graph, p), **_edge_rel(graph, p, node)}
+           for p in graph.predecessors(node)],
+        key=lambda r: _edge_priority(r["edge_type"]),
+    )
 
-    # Hop 1: direct neighbors (both directions) with full attrs
-    relations = []
-    for nb in list(graph.neighbors(node))[:fan_out]:
-        relations.append({"dir": "out", "target": nb, "target_attrs": _node_attrs(graph, nb),
-                          **_edge_rel(graph, node, nb)})
-    for parent in list(graph.predecessors(node))[:fan_out]:
-        relations.append({"dir": "in", "source": parent, "source_attrs": _node_attrs(graph, parent),
-                          **_edge_rel(graph, parent, node)})
-
-    # N-hop BFS paths (hop 2+)
     hops: dict[int, list[dict[str, Any]]] = {}
     if max_hops >= 2:
-        # BFS frontier: list of (path_nodes, relation_chain)
         visited = {node}
-        frontier: list[tuple[list[str], list[str]]] = []
-        for nb in list(graph.neighbors(node))[:fan_out]:
+        frontier: list = []
+        for nb in graph.neighbors(node):
             visited.add(nb)
             frontier.append(([node, nb], [relation_text(node, graph[node][nb]["edge_type"], nb)]))
+        for p in graph.predecessors(node):
+            if p not in visited:
+                visited.add(p)
+                frontier.append(([node, p], [relation_text(p, graph[p][node]["edge_type"], node)]))
 
         for hop in range(2, max_hops + 1):
-            next_frontier: list[tuple[list[str], list[str]]] = []
-            hop_entries: list[dict[str, Any]] = []
-            for path_nodes, chain in frontier:
-                tail = path_nodes[-1]
-                for nb in list(graph.neighbors(tail))[:fan_out]:
-                    if nb in visited:
-                        continue
-                    new_path = path_nodes + [nb]
-                    new_chain = chain + [relation_text(tail, graph[tail][nb]["edge_type"], nb)]
-                    hop_entries.append({
-                        "path": " -> ".join(new_path),
-                        "relation_chain": new_chain,
-                        "end_node_attrs": _node_attrs(graph, nb),
-                    })
-                    next_frontier.append((new_path, new_chain))
-            for entry in hop_entries:
-                for n in entry["path"].split(" -> "):
-                    visited.add(n)
-            if hop_entries:
-                hops[hop] = hop_entries[:30]
+            next_frontier = []
+            for path, chain in frontier:
+                tail = path[-1]
+                for nb in graph.neighbors(tail):
+                    if nb not in visited:
+                        visited.add(nb)
+                        next_frontier.append((path + [nb], chain + [relation_text(tail, graph[tail][nb]["edge_type"], nb)]))
+                for nb in graph.predecessors(tail):
+                    if nb not in visited:
+                        visited.add(nb)
+                        next_frontier.append((path + [nb], chain + [relation_text(nb, graph[nb][tail]["edge_type"], tail)]))
+            if next_frontier:
+                next_frontier.sort(key=lambda pc: min(
+                    _edge_priority(graph[pc[0][i]][pc[0][i+1]]["edge_type"]) if graph.has_edge(pc[0][i], pc[0][i+1])
+                    else _edge_priority(graph[pc[0][i+1]][pc[0][i]]["edge_type"])
+                    for i in range(len(pc[0]) - 1)
+                ))
+                hops[hop] = [
+                    {"path": " -> ".join(p), "relation_chain": c, "end_node_attrs": _node_attrs(graph, p[-1])}
+                    for p, c in next_frontier
+                ]
             frontier = next_frontier
             if not frontier:
                 break
@@ -401,82 +411,6 @@ def deep_node_context(graph: nx.DiGraph, node: str, max_hops: int = 1, fan_out: 
     return result
 
 
-_ANALYZE_SYSTEM = """You are a senior wealth-advisory analyst. You receive client graph data in stages.
-At each stage you may either:
-  A) Request deeper exploration — respond ONLY with: {{"explore": N}}  (N = desired max hop depth, max 6, never repeat same depth)
-  B) Produce the final answer as JSON (see format below)
-
-Request deeper exploration ONLY if promising chains are cut off and more hops would materially strengthen the briefing.
-If the node is LOW influence, return immediately — no exploration needed."""
-
-_ANALYZE_USER = """GOAL: {goal}
-WHY FLAGGED: {score_reason}
-DATA (hop depth = {depth}):
-{context}
-
-━━ TRIAGE ━━
-
-Classify each direct (1-hop) edge:
-  CAPITAL-CONTROL: owner, owns, director, shareholder, founder, settlor, beneficiary, trustee, business ownership, business profit, asset contributor, has account, sale of business
-  TRANSACTION: capital-control ONLY if this node is a named party — not if it merely works for the transacting entity
-  FAMILY: father, mother, parent, child, son, daughter, spouse, husband, wife, brother, sister, sibling, family relationship
-  LOW-POWER: works for, works at, employee, employer, shared address, shared email, shared phone, mentions, revoked
-
-≥1 capital-control or qualifying transaction → HIGH
-0 capital-control + ≥1 family edge to someone with capital-control edges (check hops data) → MEDIUM
-Everything else → LOW
-
-LOW: 2–3 sentences naming which edges exist and why none grant capital control. recommended_action = "Not recommended for outreach." Return JSON immediately.
-
-━━ BRIEFING (HIGH / MEDIUM only) ━━
-
-Write into "insight":
-
-WHO: 2–3 sentences. Name, type, 3+ connected entities, amounts/dates.
-
-CHAINS: 2+ numbered chains, different themes. Each = named step-by-step path (A → B → C) with amounts/dates, ending with the implication for the GOAL. Use hops data for depth. For MEDIUM: center on the family member who controls capital and why this node is the access path.
-
-WHY CONTACT: Strongest evidence → "Because [evidence + path], therefore [consequence]" → product/service. No fabricated urgency.
-
-Write into "recommended_action": 3 numbered items: verb + data point + product/service.
-
-━━ RULES ━━
-- ≤25 words per sentence. Plain English.
-- Never attribute a company's transaction to someone who merely works there.
-- Shared address / mentions ≠ financial control.
-- Every claim must cite a name, entity, amount, or date from the data.
-
-━━ EXAMPLES ━━
-
-HIGH:
-"John Lee works for Alpha Holdings, directs Beta Corp, and appears in 'Regulator Reviews Cross-Border Fund Flows'. He holds an investment account worth $4.2M.
-
-Chain 1 — Business: Alpha Holdings owns 60% of Beta Corp → Beta Corp sold a $12M unit to Gamma Industries → as director, John Lee controls where that $12M is reinvested.
-
-Chain 2 — Family: John Lee is father of Sarah Lee → Sarah Lee is a shareholder of Delta Financial → Delta Financial shares an address with Epsilon Trust — the family already uses trust structures and will need advice if regulations tighten.
-
-Because John Lee directs Beta Corp and Beta Corp sold $12M via Alpha Holdings, he controls this capital. He needs tax-efficient reinvestment and estate planning."
-
-"1. Call John Lee re: $12M Beta Corp sale — as director he controls allocation.
-2. Meet John Lee + Sarah Lee to review Epsilon Trust exposure — regulatory mention makes it timely.
-3. Send portfolio proposal for his $4.2M account — consolidate personal + corporate wealth."
-
-MEDIUM:
-"Mary Chen has no ownership or directorship. She is the spouse of David Chen.
-
-Chain 1 — Family: Mary Chen is spouse of David Chen → David Chen founded Horizon Capital ($28M AUM) → Horizon Capital owns 40% of Jade Properties — Mary Chen is the access path to $28M+ controlled by David Chen.
-
-Because David Chen controls $28M via Horizon Capital and Mary Chen is his spouse, she is the natural introduction point. Estate and succession planning fits both."
-
-"1. Invite Mary Chen to a wealth-planning seminar — position as family wellness.
-2. Through Mary Chen, request intro to David Chen re: Horizon Capital succession.
-3. Propose joint estate review — $28M+ in business assets needs protection."
-
-━━ RETURN ━━
-Return ONLY: {{"influence_level": "HIGH|MEDIUM|LOW", "insight": "...", "recommended_action": "..."}}
-Or to explore deeper: {{"explore": N}}"""
-
-
 def analyze_node(
     node: str,
     artifacts: GraphArtifacts,
@@ -485,22 +419,68 @@ def analyze_node(
     llm: OpenAI,
     score_reason: str = "",
     max_iterations: int = 5,
+    hop_callback: Callable[[int, str, str], None] | None = None,
 ) -> dict[str, str]:
+    _SYSTEM = """Senior wealth-advisory analyst. Each turn: respond {{"explore": N}} (max depth 6, never repeat same depth) if promising chains are cut off, or return final JSON. Return immediately for LOW nodes."""
+
+    _USER = """GOAL: {goal}
+FLAGGED BECAUSE: {score_reason}
+DATA (depth={depth}):
+{context}
+
+━━ TRIAGE ━━
+CAPITAL-CONTROL: owner, owns, director, shareholder, founder, settlor, beneficiary, trustee, business ownership, business profit, asset contributor, has account, sale of business
+FAMILY: father, mother, parent, child, son, daughter, spouse, husband, wife, brother, sister, sibling, family relationship
+LOW-POWER: works for, works at, employee, employer, shared address, shared email, shared phone, mentions, revoked
+
+HIGH: ≥1 capital-control edge
+MEDIUM: no capital-control + ≥1 family edge to a node that has capital-control edges (verify in hops)
+LOW: everything else → 2–3 sentences on why no capital control, recommended_action = "Not recommended for outreach." Return JSON immediately.
+
+━━ BRIEFING (HIGH / MEDIUM only) ━━
+"insight" must contain three parts:
+1. WHO (2 sentences): name + CAPITAL-CONTROL roles/accounts only. Never mention LOW-POWER edges.
+2. CHAINS (2+, different themes): literal entity names from relations/hops as a step-by-step path —
+   A [edge] → B [edge] → C — financial implication for the GOAL.
+   Only CAPITAL-CONTROL or FAMILY edges at every step. Use hops for multi-hop paths.
+   MEDIUM: one chain must show the family member's capital and why this node is the entry path.
+3. WHY CONTACT: "Because [named path + evidence], therefore [consequence]" → specific product.
+
+"recommended_action": 3 items — verb + specific entity/amount from data + product/service.
+
+━━ EXAMPLE — HIGH ━━
+insight: "John Lee is a director of Beta Corp and a shareholder of Delta Financial. He holds a $4.2M account linked to Epsilon Trust.
+Chain 1 — Control: John Lee [director] → Beta Corp ← [60% owned by] Alpha Holdings → Beta Corp sold $12M to Gamma Industries — Lee controls reinvestment of that capital.
+Chain 2 — Wealth: John Lee [shareholder] → Delta Financial [beneficiary of] → Epsilon Trust [holds] → Lee's $4.2M account — corporate equity and trust structures need coordinated advice.
+Because Lee directs Beta Corp ($12M sale) and holds $4.2M through Epsilon Trust, he needs reinvestment structuring and estate planning."
+recommended_action: "1. Call re: $12M Beta Corp sale — controls capital allocation. 2. Review $4.2M Epsilon Trust account — integrated trust-portfolio strategy. 3. Meet re: Delta Financial shareholding — succession and liquidity planning."
+
+━━ EXAMPLE — MEDIUM ━━
+insight: "Mary Chen has no capital-control edges. She is the spouse of David Chen.
+Chain 1 — Family access: Mary Chen [spouse of] → David Chen [founder of] → Horizon Capital ($28M AUM) [owns 40% of] → Jade Properties — Mary is the entry path to David's $28M.
+Because David controls $28M via Horizon Capital, Mary is the natural introduction for estate and succession planning."
+recommended_action: "1. Invite Mary to wealth seminar — family financial wellness. 2. Request intro to David re: Horizon Capital ($28M) succession. 3. Propose joint estate review — $28M in business assets needs protection."
+
+━━ RETURN ━━
+{{"influence_level": "HIGH|MEDIUM|LOW", "insight": "...", "recommended_action": "..."}}
+Or: {{"explore": N}}"""
+
     graph = artifacts.graph
-    current_depth = 1
-    messages: list[dict[str, str]] = [{"role": "system", "content": _ANALYZE_SYSTEM}]
+    depth = 1
+    messages: list[dict[str, str]] = [{"role": "system", "content": _SYSTEM}]
 
     for _ in range(max_iterations):
-        ctx = deep_node_context(graph, node, max_hops=current_depth)
-        ctx_json = json.dumps(ctx, ensure_ascii=False, default=str)
-        messages.append({"role": "user", "content": _ANALYZE_USER.format(
-            goal=final_goal, score_reason=score_reason, depth=current_depth, context=ctx_json,
-        )})
+        ctx = deep_node_context(graph, node, max_hops=depth)
+        if hop_callback:
+            hop_callback(depth, "fetching", f"{len(ctx.get('relations', []))} direct relations, {sum(len(v) for v in ctx.get('hops', {}).values())} extended paths")
 
-        response = llm.chat.completions.create(
+        messages.append({"role": "user", "content": _USER.format(
+            goal=final_goal, score_reason=score_reason, depth=depth,
+            context=json.dumps(ctx, ensure_ascii=False, default=str),
+        )})
+        raw = strip_fences(llm.chat.completions.create(
             model=config.llm_model, messages=messages, temperature=0.2,
-        )
-        raw = strip_fences(response.choices[0].message.content)
+        ).choices[0].message.content)
         messages.append({"role": "assistant", "content": raw})
 
         try:
@@ -509,30 +489,26 @@ def analyze_node(
             break
 
         if "explore" in result:
-            requested = min(int(result["explore"]), 6)
-            if requested <= current_depth:
+            if min(int(result["explore"]), 6) <= depth:
                 break
-            current_depth = requested
+            depth += 1
+            if hop_callback:
+                hop_callback(depth - 1, "explore_requested", f"→ Hop {depth}")
             continue
 
-        # LOW nodes short-circuit — no further exploration needed
-        return {
-            "influence_level": result.get("influence_level", "MEDIUM"),
-            "insight": result.get("insight", ""),
-            "recommended_action": result.get("recommended_action", ""),
-        }
+        influence = result.get("influence_level", "MEDIUM")
+        if hop_callback:
+            hop_callback(depth, "final", influence)
+        return {"influence_level": influence, "insight": result.get("insight", ""), "recommended_action": result.get("recommended_action", "")}
 
-    # Fallback: force final answer with all accumulated context
     messages.append({"role": "user", "content": "Produce the final briefing now. Return ONLY the JSON with influence_level, insight, and recommended_action."})
-    response = llm.chat.completions.create(
+    result = json.loads(strip_fences(llm.chat.completions.create(
         model=config.llm_model, messages=messages, temperature=0.2,
-    )
-    result = json.loads(strip_fences(response.choices[0].message.content))
-    return {
-        "influence_level": result.get("influence_level", "MEDIUM"),
-        "insight": result.get("insight", ""),
-        "recommended_action": result.get("recommended_action", ""),
-    }
+    ).choices[0].message.content))
+    influence = result.get("influence_level", "MEDIUM")
+    if hop_callback:
+        hop_callback(depth, "final", influence)
+    return {"influence_level": influence, "insight": result.get("insight", ""), "recommended_action": result.get("recommended_action", "")}
 
 
 def score_batch(

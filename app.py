@@ -251,6 +251,24 @@ def run_pipeline(
     return final_results, new_rules
 
 
+def _hop_trail_md(hop_log: list[tuple[int, str, str]]) -> str:
+    per_depth: dict[int, list] = {}
+    for depth, event, detail in hop_log:
+        per_depth.setdefault(depth, []).append((event, detail))
+    lines = []
+    for depth in sorted(per_depth.keys()):
+        evts = per_depth[depth]
+        fetch_det = next((det for e, det in evts if e == "fetching"), "")
+        terminal = next(((e, det) for e, det in reversed(evts) if e in ("explore_requested", "final")), None)
+        if terminal is None:
+            lines.append(f"⏳ **Hop {depth}** — {fetch_det}")
+        elif terminal[0] == "explore_requested":
+            lines.append(f"✓ **Hop {depth}** — {fetch_det} · LLM going deeper {terminal[1]}")
+        else:
+            lines.append(f"✓ **Hop {depth}** — {fetch_det} · **{terminal[1]}**")
+    return "  \n".join(lines)
+
+
 ensure_state()
 
 pill_1 = "Ready" if st.session_state.artifacts_ready else "Not Ready"
@@ -445,16 +463,23 @@ with st.container(border=True):
                             try:
                                 llm = init_llm_client()
                                 cfg = LeadGenConfig(debug=False, auto_write_rules=False)
-                                with st.spinner(f"Analyzing {selected_node}..."):
-                                    analysis = analyze_node(
-                                        node=selected_node,
-                                        artifacts=runtime_artifacts,
-                                        final_goal=goal,
-                                        config=cfg,
-                                        llm=llm,
-                                        score_reason=str(selected_row.get("reason", "")),
-                                    )
-                                st.session_state.node_analysis[selected_node] = analysis
+                                hop_log: list[tuple[int, str, str]] = []
+                                log_placeholder = st.empty()
+
+                                def on_hop(depth: int, event: str, detail: str) -> None:
+                                    hop_log.append((depth, event, detail))
+                                    log_placeholder.markdown(_hop_trail_md(hop_log))
+
+                                analysis = analyze_node(
+                                    node=selected_node,
+                                    artifacts=runtime_artifacts,
+                                    final_goal=goal,
+                                    config=cfg,
+                                    llm=llm,
+                                    score_reason=str(selected_row.get("reason", "")),
+                                    hop_callback=on_hop,
+                                )
+                                st.session_state.node_analysis[selected_node] = {"result": analysis, "hop_log": list(hop_log)}
                                 st.info("Analysis ready — open the **Client Narrative** tab.")
                             except Exception as exc:
                                 st.session_state.last_error = str(exc)
@@ -476,11 +501,17 @@ with st.container(border=True):
     with tab2:
         selected = st.session_state.selected_analysis_node
         if selected and selected in st.session_state.node_analysis:
-            detail = st.session_state.node_analysis[selected]
+            entry = st.session_state.node_analysis[selected]
+            detail = entry["result"]
+            hop_log = entry.get("hop_log", [])
             influence = detail.get("influence_level", "MEDIUM")
             worth = influence != "LOW"
             insight = detail.get("insight", "").replace("\n", "<br>")
             action = detail.get("recommended_action", "").replace("\n", "<br>")
+
+            if hop_log:
+                with st.expander("Analysis path", expanded=False):
+                    st.markdown(_hop_trail_md(hop_log))
 
             if not worth:
                 st.markdown(
