@@ -231,7 +231,7 @@ def run_pipeline(
         batch = candidates[start : start + batch_size]
         if status_callback:
             status_callback(f"Scoring batch {batch_index}/{total_batches} ({len(batch)} nodes)...")
-        all_results.extend(score_batch(batch, artifacts, goal, cfg, llm))
+        all_results.extend(score_batch(batch, artifacts, cfg, llm))
         if progress_bar:
             progress_bar.progress(min(80, 25 + int(55 * batch_index / max(total_batches, 1))))
 

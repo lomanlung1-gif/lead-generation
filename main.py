@@ -424,29 +424,42 @@ def analyze_node(
     context_json = json.dumps(context, ensure_ascii=False, default=str)
 
     prompt = f"""
-    You are a senior wealth management advisor writing a client briefing from graph data.
+You are a senior wealth management advisor. Write a client briefing that reads like a clear, logical story — not a data dump.
 
-    ### GOAL:
-    {final_goal}
+### GOAL:
+{final_goal}
 
-    ### NODE CONTEXT:
-    {context_json}
+### NODE CONTEXT (raw graph data — synthesize, do not echo field names):
+{context_json}
 
-    ### INITIAL TARGETING REASON:
-    {score_reason}
+### WHY THIS CLIENT WAS FLAGGED:
+{score_reason}
 
-    ### WRITING RULES:
-    - Use ONLY plain English. Never output JSON field names like edge_type, dir, target_attrs.
-    - When describing relationships, trace complete chains: e.g. "John is the father of Alice, who owns Acme Corp, which received a $2M transaction from Beta LLC."
-    - The "hops" array in third_hop gives you the plain-English chain — stitch those sentences together into a single narrative thread.
-    - Every claim must cite a specific name, amount, or relationship from the data.
+### HOW TO WRITE THE INSIGHT:
+Write ONE continuous narrative (3-4 paragraphs) that flows like this:
 
-    ### OUTPUT FORMAT (return ONLY this JSON):
-    {{{{
-      "insight": "<Client Profile>\n<paragraph: who this person/org is, their role, type, and key attributes>\n\n<Key Relationships>\n<paragraph: trace the most important 1-hop, 2-hop, and 3-hop relationship chains as connected narratives, not isolated bullet points. Explain how each chain connects back to this client.>\n\n<Financial Signals & Life Events>\n<paragraph: ownership stakes, transactions, liquidity events, account activity, or life changes visible in the data. Cite amounts, dates, or edge details when available.>",
-      "recommended_action": "1. <Specific action> — Evidence: <cite the exact relationship chain or data point> — Rationale: <why this action fits the goal>\n2. <Specific action> — Evidence: <cite> — Rationale: <why>\n3. <Specific action> — Evidence: <cite> — Rationale: <why>"
-    }}}}
-    """
+Paragraph 1 — WHO: Introduce the client. State their name, type (person/org), and the single most important fact about them (e.g., role, net worth, recent life event). One or two sentences.
+
+Paragraph 2 — NETWORK STORY: This is the core. Tell the story of how this client is connected to money, influence, or opportunity by tracing relationship chains end-to-end. Do NOT list relationships one by one. Instead, weave them: "A is the father of B, who owns C, which recently transacted with D — meaning A sits at the center of a family wealth structure spanning multiple entities." Use the third_hop data to extend chains. Every chain must end with a "so what" — what does this chain mean for the client's wealth or opportunity?
+
+Paragraph 3 — OPPORTUNITY SIGNAL: Based on the chains above, explain the specific financial signal or life event that makes this client actionable RIGHT NOW. Connect it back to the goal. Be explicit: "Because X happened (cite evidence), this client likely needs Y."
+
+### HOW TO WRITE THE RECOMMENDED ACTIONS:
+Write 3 numbered actions. Each action must follow this exact logic:
+
+"[Number]. [What to do] — because [cite the specific relationship chain or data point from the insight above that justifies this action], this client likely [explain the client need this addresses], which directly supports [tie back to the goal]."
+
+Each action must reference something already stated in the insight — if you can't trace it back, don't include it.
+
+### RULES:
+- Plain English only. Never output JSON keys, field names, or technical graph terms.
+- Never list relationships as bullet points or isolated facts. Always connect them into chains.
+- Every claim needs a specific name or data point behind it.
+- The reader should finish the insight and think: "I understand exactly who this person is, why they matter, and what to do next."
+
+Return ONLY this JSON (no other text):
+{{{{"insight": "...", "recommended_action": "..."}}}}
+"""
 
     response = llm.chat.completions.create(
         model=config.llm_model,
@@ -463,7 +476,6 @@ def analyze_node(
 def score_batch(
     nodes: list[str],
     artifacts: GraphArtifacts,
-    final_goal: str,
     config: LeadGenConfig,
     llm: OpenAI,
 ) -> list[dict[str, Any]]:
@@ -472,10 +484,7 @@ def score_batch(
     prompt = (
         f"""
         Your task is to evaluate how well each node in the provided list of candidates aligns with the TOPOLOGY RULES and contributes to achieving the GOAL.
-        
-        ### GOAL:
-        {final_goal}
-        
+     
         ### TOPOLOGY RULES (primary optimization target):
         {artifacts.topology}
 
@@ -484,7 +493,7 @@ def score_batch(
 
         ### RULES FOR SCORING:
         - Score each node 0-100 on how strongly it aligns with the TOPOLOGY RULES.
-        - If Topology Rules apply to Person/Individual ONLY but the node is Organization/other types -> 0 score. 
+        - If Topology Rules apply to Person ONLY and the node is also the same type -> HIGHER score. 
         - Use topology rules AND node/edge data as evidence for your scoring.
         - Read relation_text first because it gives the plain-English meaning of each edge.
         - Use edge_type, dir, source, and target as the structured ground truth for validation.
@@ -507,8 +516,8 @@ def score_batch(
     except Exception as exc:
         if "context length" in str(exc).lower() and len(nodes) > 1:
             mid = len(nodes) // 2
-            left = score_batch(nodes[:mid], artifacts, final_goal, config, llm)
-            right = score_batch(nodes[mid:], artifacts, final_goal, config, llm)
+            left = score_batch(nodes[:mid], artifacts, config, llm)
+            right = score_batch(nodes[mid:], artifacts, config, llm)
             return left + right
         raise
 
@@ -646,7 +655,7 @@ def generate_targets(
     try:
         for start in range(0, len(candidates), batch_size):
             batch = candidates[start : start + batch_size]
-            targets = score_batch(batch, artifacts, final_goal, cfg, llm)
+            targets = score_batch(batch, artifacts, cfg, llm)
             all_results.extend(targets)
     except Exception as exc:
         print(f"LLM error: {exc}")
@@ -671,7 +680,6 @@ if __name__ == "__main__":
         final_goal="Increase financial product sales revenue by identifying high-value prospective clients",
         topology_path="topology.md",
         config=config
-        
     )
 
     print("\n=== High-Priority Target List ===")
