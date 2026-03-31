@@ -333,83 +333,148 @@ def score_context(graph: nx.DiGraph, node: str) -> dict[str, Any]:
 
 
 
-def deep_node_context(graph: nx.DiGraph, node: str) -> dict[str, Any]:
-    attrs = {str(k): str(v)[:400] for k, v in graph.nodes[node].items() if not pd.isna(v)}
+def _node_attrs(graph: nx.DiGraph, n: str, limit: int = 200) -> dict[str, str]:
+    return {str(k): str(v)[:limit] for k, v in graph.nodes[n].items() if not pd.isna(v)}
 
-    out_rels = []
-    for nb in list(graph.neighbors(node))[:15]:
-        d = graph[node][nb]
-        nb_attrs = {str(k): str(v)[:200] for k, v in graph.nodes[nb].items() if not pd.isna(v)}
-        rel: dict[str, Any] = {
-            "dir": "out",
-            "edge_type": d["edge_type"],
-            "target": nb,
-            "target_attrs": nb_attrs,
-            "relation_text": relation_text(node, d["edge_type"], nb),
-        }
-        if d.get("edge_info"):
-            rel["edge_info"] = str(d["edge_info"])[:400]
-        out_rels.append(rel)
 
-    in_rels = []
-    for parent in list(graph.predecessors(node))[:15]:
-        d = graph[parent][node]
-        parent_attrs = {
-            str(k): str(v)[:200] for k, v in graph.nodes[parent].items() if not pd.isna(v)
-        }
-        rel: dict[str, Any] = {
-            "dir": "in",
-            "edge_type": d["edge_type"],
-            "source": parent,
-            "source_attrs": parent_attrs,
-            "relation_text": relation_text(parent, d["edge_type"], node),
-        }
-        if d.get("edge_info"):
-            rel["edge_info"] = str(d["edge_info"])[:400]
-        in_rels.append(rel)
-
-    second_hop = []
-    for nb in list(graph.neighbors(node))[:10]:
-        for nb2 in list(graph.neighbors(nb))[:5]:
-            if nb2 == node:
-                continue
-            d2 = graph[nb][nb2]
-            second_hop.append(
-                {
-                    "path": f"{node} -> {nb} -> {nb2}",
-                    "edge_type": d2["edge_type"],
-                    "relation_text": relation_text(nb, d2["edge_type"], nb2),
-                }
-            )
-
-    third_hop = []
-    visited_2hop = {(nb, nb2) for item in second_hop for nb, nb2 in [(item["path"].split(" -> ")[1], item["path"].split(" -> ")[2])]}
-    for nb in list(graph.neighbors(node))[:8]:
-        for nb2 in list(graph.neighbors(nb))[:4]:
-            if nb2 == node:
-                continue
-            for nb3 in list(graph.neighbors(nb2))[:3]:
-                if nb3 == node or nb3 == nb:
-                    continue
-                d3 = graph[nb2][nb3]
-                third_hop.append(
-                    {
-                        "path": f"{node} -> {nb} -> {nb2} -> {nb3}",
-                        "hops": [
-                            relation_text(node, graph[node][nb]["edge_type"], nb),
-                            relation_text(nb, graph[nb][nb2]["edge_type"], nb2),
-                            relation_text(nb2, d3["edge_type"], nb3),
-                        ],
-                    }
-                )
-
-    return {
-        "node": node,
-        "attrs": attrs,
-        "relations": out_rels + in_rels,
-        "second_hop": second_hop[:20],
-        "third_hop": third_hop[:15],
+def _edge_rel(graph: nx.DiGraph, src: str, dst: str) -> dict[str, Any]:
+    d = graph[src][dst]
+    rel: dict[str, Any] = {
+        "edge_type": d["edge_type"],
+        "relation_text": relation_text(src, d["edge_type"], dst),
     }
+    if d.get("edge_info"):
+        rel["edge_info"] = str(d["edge_info"])[:300]
+    return rel
+
+
+def deep_node_context(graph: nx.DiGraph, node: str, max_hops: int = 1, fan_out: int = 15) -> dict[str, Any]:
+    attrs = _node_attrs(graph, node, limit=400)
+
+    # Hop 1: direct neighbors (both directions) with full attrs
+    relations = []
+    for nb in list(graph.neighbors(node))[:fan_out]:
+        relations.append({"dir": "out", "target": nb, "target_attrs": _node_attrs(graph, nb),
+                          **_edge_rel(graph, node, nb)})
+    for parent in list(graph.predecessors(node))[:fan_out]:
+        relations.append({"dir": "in", "source": parent, "source_attrs": _node_attrs(graph, parent),
+                          **_edge_rel(graph, parent, node)})
+
+    # N-hop BFS paths (hop 2+)
+    hops: dict[int, list[dict[str, Any]]] = {}
+    if max_hops >= 2:
+        # BFS frontier: list of (path_nodes, relation_chain)
+        visited = {node}
+        frontier: list[tuple[list[str], list[str]]] = []
+        for nb in list(graph.neighbors(node))[:fan_out]:
+            visited.add(nb)
+            frontier.append(([node, nb], [relation_text(node, graph[node][nb]["edge_type"], nb)]))
+
+        for hop in range(2, max_hops + 1):
+            next_frontier: list[tuple[list[str], list[str]]] = []
+            hop_entries: list[dict[str, Any]] = []
+            for path_nodes, chain in frontier:
+                tail = path_nodes[-1]
+                for nb in list(graph.neighbors(tail))[:fan_out]:
+                    if nb in visited:
+                        continue
+                    new_path = path_nodes + [nb]
+                    new_chain = chain + [relation_text(tail, graph[tail][nb]["edge_type"], nb)]
+                    hop_entries.append({
+                        "path": " -> ".join(new_path),
+                        "relation_chain": new_chain,
+                        "end_node_attrs": _node_attrs(graph, nb),
+                    })
+                    next_frontier.append((new_path, new_chain))
+            for entry in hop_entries:
+                for n in entry["path"].split(" -> "):
+                    visited.add(n)
+            if hop_entries:
+                hops[hop] = hop_entries[:30]
+            frontier = next_frontier
+            if not frontier:
+                break
+
+    result: dict[str, Any] = {"node": node, "attrs": attrs, "relations": relations}
+    if hops:
+        result["hops"] = hops
+    return result
+
+
+_ANALYZE_SYSTEM = """You are a senior wealth-advisory analyst. You receive client graph data in stages.
+At each stage you may either:
+  A) Request deeper exploration — respond ONLY with: {{"explore": N}}  (N = desired max hop depth, max 6, never repeat same depth)
+  B) Produce the final answer as JSON (see format below)
+
+Request deeper exploration ONLY if promising chains are cut off and more hops would materially strengthen the briefing.
+If the node is LOW influence, return immediately — no exploration needed."""
+
+_ANALYZE_USER = """GOAL: {goal}
+WHY FLAGGED: {score_reason}
+DATA (hop depth = {depth}):
+{context}
+
+━━ TRIAGE ━━
+
+Classify each direct (1-hop) edge:
+  CAPITAL-CONTROL: owner, owns, director, shareholder, founder, settlor, beneficiary, trustee, business ownership, business profit, asset contributor, has account, sale of business
+  TRANSACTION: capital-control ONLY if this node is a named party — not if it merely works for the transacting entity
+  FAMILY: father, mother, parent, child, son, daughter, spouse, husband, wife, brother, sister, sibling, family relationship
+  LOW-POWER: works for, works at, employee, employer, shared address, shared email, shared phone, mentions, revoked
+
+≥1 capital-control or qualifying transaction → HIGH
+0 capital-control + ≥1 family edge to someone with capital-control edges (check hops data) → MEDIUM
+Everything else → LOW
+
+LOW: 2–3 sentences naming which edges exist and why none grant capital control. recommended_action = "Not recommended for outreach." Return JSON immediately.
+
+━━ BRIEFING (HIGH / MEDIUM only) ━━
+
+Write into "insight":
+
+WHO: 2–3 sentences. Name, type, 3+ connected entities, amounts/dates.
+
+CHAINS: 2+ numbered chains, different themes. Each = named step-by-step path (A → B → C) with amounts/dates, ending with the implication for the GOAL. Use hops data for depth. For MEDIUM: center on the family member who controls capital and why this node is the access path.
+
+WHY CONTACT: Strongest evidence → "Because [evidence + path], therefore [consequence]" → product/service. No fabricated urgency.
+
+Write into "recommended_action": 3 numbered items: verb + data point + product/service.
+
+━━ RULES ━━
+- ≤25 words per sentence. Plain English.
+- Never attribute a company's transaction to someone who merely works there.
+- Shared address / mentions ≠ financial control.
+- Every claim must cite a name, entity, amount, or date from the data.
+
+━━ EXAMPLES ━━
+
+HIGH:
+"John Lee works for Alpha Holdings, directs Beta Corp, and appears in 'Regulator Reviews Cross-Border Fund Flows'. He holds an investment account worth $4.2M.
+
+Chain 1 — Business: Alpha Holdings owns 60% of Beta Corp → Beta Corp sold a $12M unit to Gamma Industries → as director, John Lee controls where that $12M is reinvested.
+
+Chain 2 — Family: John Lee is father of Sarah Lee → Sarah Lee is a shareholder of Delta Financial → Delta Financial shares an address with Epsilon Trust — the family already uses trust structures and will need advice if regulations tighten.
+
+Because John Lee directs Beta Corp and Beta Corp sold $12M via Alpha Holdings, he controls this capital. He needs tax-efficient reinvestment and estate planning."
+
+"1. Call John Lee re: $12M Beta Corp sale — as director he controls allocation.
+2. Meet John Lee + Sarah Lee to review Epsilon Trust exposure — regulatory mention makes it timely.
+3. Send portfolio proposal for his $4.2M account — consolidate personal + corporate wealth."
+
+MEDIUM:
+"Mary Chen has no ownership or directorship. She is the spouse of David Chen.
+
+Chain 1 — Family: Mary Chen is spouse of David Chen → David Chen founded Horizon Capital ($28M AUM) → Horizon Capital owns 40% of Jade Properties — Mary Chen is the access path to $28M+ controlled by David Chen.
+
+Because David Chen controls $28M via Horizon Capital and Mary Chen is his spouse, she is the natural introduction point. Estate and succession planning fits both."
+
+"1. Invite Mary Chen to a wealth-planning seminar — position as family wellness.
+2. Through Mary Chen, request intro to David Chen re: Horizon Capital succession.
+3. Propose joint estate review — $28M+ in business assets needs protection."
+
+━━ RETURN ━━
+Return ONLY: {{"influence_level": "HIGH|MEDIUM|LOW", "insight": "...", "recommended_action": "..."}}
+Or to explore deeper: {{"explore": N}}"""
 
 
 def analyze_node(
@@ -419,55 +484,52 @@ def analyze_node(
     config: LeadGenConfig,
     llm: OpenAI,
     score_reason: str = "",
+    max_iterations: int = 5,
 ) -> dict[str, str]:
-    context = deep_node_context(artifacts.graph, node)
-    context_json = json.dumps(context, ensure_ascii=False, default=str)
+    graph = artifacts.graph
+    current_depth = 1
+    messages: list[dict[str, str]] = [{"role": "system", "content": _ANALYZE_SYSTEM}]
 
-    prompt = f"""
-You are a senior wealth management advisor. Write a client briefing that reads like a clear, logical story — not a data dump.
+    for _ in range(max_iterations):
+        ctx = deep_node_context(graph, node, max_hops=current_depth)
+        ctx_json = json.dumps(ctx, ensure_ascii=False, default=str)
+        messages.append({"role": "user", "content": _ANALYZE_USER.format(
+            goal=final_goal, score_reason=score_reason, depth=current_depth, context=ctx_json,
+        )})
 
-### GOAL:
-{final_goal}
+        response = llm.chat.completions.create(
+            model=config.llm_model, messages=messages, temperature=0.2,
+        )
+        raw = strip_fences(response.choices[0].message.content)
+        messages.append({"role": "assistant", "content": raw})
 
-### NODE CONTEXT (raw graph data — synthesize, do not echo field names):
-{context_json}
+        try:
+            result = json.loads(raw)
+        except json.JSONDecodeError:
+            break
 
-### WHY THIS CLIENT WAS FLAGGED:
-{score_reason}
+        if "explore" in result:
+            requested = min(int(result["explore"]), 6)
+            if requested <= current_depth:
+                break
+            current_depth = requested
+            continue
 
-### HOW TO WRITE THE INSIGHT:
-Write ONE continuous narrative (3-4 paragraphs) that flows like this:
+        # LOW nodes short-circuit — no further exploration needed
+        return {
+            "influence_level": result.get("influence_level", "MEDIUM"),
+            "insight": result.get("insight", ""),
+            "recommended_action": result.get("recommended_action", ""),
+        }
 
-Paragraph 1 — WHO: Introduce the client. State their name, type (person/org), and the single most important fact about them (e.g., role, net worth, recent life event). One or two sentences.
-
-Paragraph 2 — NETWORK STORY: This is the core. Tell the story of how this client is connected to money, influence, or opportunity by tracing relationship chains end-to-end. Do NOT list relationships one by one. Instead, weave them: "A is the father of B, who owns C, which recently transacted with D — meaning A sits at the center of a family wealth structure spanning multiple entities." Use the third_hop data to extend chains. Every chain must end with a "so what" — what does this chain mean for the client's wealth or opportunity?
-
-Paragraph 3 — OPPORTUNITY SIGNAL: Based on the chains above, explain the specific financial signal or life event that makes this client actionable RIGHT NOW. Connect it back to the goal. Be explicit: "Because X happened (cite evidence), this client likely needs Y."
-
-### HOW TO WRITE THE RECOMMENDED ACTIONS:
-Write 3 numbered actions. Each action must follow this exact logic:
-
-"[Number]. [What to do] — because [cite the specific relationship chain or data point from the insight above that justifies this action], this client likely [explain the client need this addresses], which directly supports [tie back to the goal]."
-
-Each action must reference something already stated in the insight — if you can't trace it back, don't include it.
-
-### RULES:
-- Plain English only. Never output JSON keys, field names, or technical graph terms.
-- Never list relationships as bullet points or isolated facts. Always connect them into chains.
-- Every claim needs a specific name or data point behind it.
-- The reader should finish the insight and think: "I understand exactly who this person is, why they matter, and what to do next."
-
-Return ONLY this JSON (no other text):
-{{{{"insight": "...", "recommended_action": "..."}}}}
-"""
-
+    # Fallback: force final answer with all accumulated context
+    messages.append({"role": "user", "content": "Produce the final briefing now. Return ONLY the JSON with influence_level, insight, and recommended_action."})
     response = llm.chat.completions.create(
-        model=config.llm_model,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.2,
+        model=config.llm_model, messages=messages, temperature=0.2,
     )
     result = json.loads(strip_fences(response.choices[0].message.content))
     return {
+        "influence_level": result.get("influence_level", "MEDIUM"),
         "insight": result.get("insight", ""),
         "recommended_action": result.get("recommended_action", ""),
     }
