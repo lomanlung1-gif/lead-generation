@@ -61,12 +61,19 @@ You are an intelligence analyst. Write a concise briefing for:
 TARGET: {target}
 GOAL: {goal}
 
+STRICT RULES:
+- ONLY describe relationships explicitly present in the GRAPH INTELLIGENCE below.
+- Indirect connections (marked "via FAMILY" or "via CONTROL") are multi-hop.
+    Describe them as indirect - do NOT treat them as direct relationships.
+- Do NOT infer, fabricate, or speculate about connections not shown in the data.
+- If a multi-hop event has unclear relevance to TARGET, acknowledge the uncertainty.
+
 Cover:
     (1) Identity & controlled assets
-    (2) Events creating opportunity or risk
+        (2) Events creating opportunity or risk - state the actual connection path
     (3) Recommended approach angle
 
-Weave a coherent narrative. Prioritise ⚡ items. Do not enumerate—tell the story.
+Prioritise ⚡ items only where genuinely relevant. Narrative form, no lists.
 
 GRAPH INTELLIGENCE:
 {ctx}
@@ -590,14 +597,53 @@ def _threads(
         edge_key = _edge_key(edge)
         if edge_key in used:
             continue
-        if bool(tag.get("hot", False)):
-            label = f"⚡{str(tag.get('cat', 'OTHER')).strip().upper() or 'OTHER'}_INDIRECT"
+
+        if not bool(tag.get("hot", False)):
+            continue
+
+        src, tgt = edge["source"], edge["target"]
+        if center in (src, tgt):
+            continue
+
+        # Only keep 2-hop hot edges when the intermediary has a verified FAMILY/CONTROL bridge to center.
+        for endpoint in (src, tgt):
+            bridge = next(
+                (
+                    edge2
+                    for edge2 in adj.get(str(endpoint), [])
+                    if center in (edge2["source"], edge2["target"]) and _edge_key(edge2) != edge_key
+                ),
+                None,
+            )
+            if not bridge:
+                continue
+
+            bridge_idx = edge_index.get(_edge_key(bridge))
+            if bridge_idx is None:
+                continue
+
+            bridge_cat = str(tags[bridge_idx].get("cat", "")).strip().upper()
+            if bridge_cat not in {"FAMILY", "CONTROL"}:
+                continue
+
+            far = tgt if endpoint == src else src
+            chain = (
+                f"{_node_label(nodes.get(center), center)} "
+                f"—[{bridge['edge_type']}]→ "
+                f"{_node_label(nodes.get(endpoint), endpoint)} "
+                f"—[{edge['edge_type']}]→ "
+                f"{_node_label(nodes.get(far), far)}"
+            )
+            label = f"⚡{str(tag.get('cat', 'OTHER')).strip().upper() or 'OTHER'}_VIA_{bridge_cat}"
             thread = bucket(label)
             thread.label = label
-            thread.pri = max(thread.pri, float(tag.get("pri", 0.3)))
-            thread.lines.append("⚡ (2-hop) " + _eline(edge, nodes))
+            thread.pri = max(thread.pri, float(tag.get("pri", 0.3)) * 0.7)
+            info = f" | {str(edge['edge_info'])[:120]}" if edge.get("edge_info") else ""
+            thread.lines.append(f"⚡ (via {bridge_cat}): {chain}{info}")
             used.add(edge_key)
+            break
 
+    # Remainder: only unused direct edges attached to the center.
     remainder = [
         (edge, tags[idx])
         for idx, edge in enumerate(edges)
@@ -890,7 +936,7 @@ if __name__ == "__main__":
     artifacts = load_artifacts("COI_Template.xlsx", "topology.md", config)
     llm = init_llm_client()
     final_goal = "Identify high-potential leads for financial services based on their relationships and attributes in the graph."
-    node = "Roy Bagattini"
+    node = "Hubertus von Baumbach"
     print("\n=== analyze_node test ===")
     print(analyze_node(node, artifacts, final_goal, config, llm))
 
