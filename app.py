@@ -476,7 +476,6 @@ with st.container(border=True):
                                     final_goal=goal,
                                     config=cfg,
                                     llm=llm,
-                                    score_reason=str(selected_row.get("reason", "")),
                                     hop_callback=on_hop,
                                 )
                                 st.session_state.node_analysis[selected_node] = {"result": analysis, "hop_log": list(hop_log)}
@@ -504,10 +503,9 @@ with st.container(border=True):
             entry = st.session_state.node_analysis[selected]
             detail = entry["result"]
             hop_log = entry.get("hop_log", [])
-            influence = detail.get("influence_level", "MEDIUM")
-            worth = influence != "LOW"
             insight = detail.get("insight", "").replace("\n", "<br>")
             action = detail.get("recommended_action", "").replace("\n", "<br>")
+            worth = detail.get("recommended_action", "").strip() != "Not recommended for outreach."
 
             if hop_log:
                 with st.expander("Analysis path", expanded=False):
@@ -517,23 +515,16 @@ with st.container(border=True):
                 st.markdown(
                     f'<div class="narrative-card" style="background:#f8f9fa; border-color:#d1d5db;">'
                     f'<div class="narrative-title" style="color:#6b7280;">'
-                    f'Client Narrative: {selected}'
-                    f'<span style="margin-left:0.6rem; padding:0.15rem 0.5rem; border-radius:999px; font-size:0.72rem; font-weight:700; background:#fee2e2; color:#991b1b; border:1px solid #fca5a5;">'
-                    f'{influence} INFLUENCE — NOT RECOMMENDED</span></div>'
+                    f'Client Narrative: {selected} — Not Recommended</div>'
                     f'<div class="narrative-label" style="color:#6b7280;">Why Not Worth Contacting</div>'
                     f'<div class="narrative-body" style="color:#6b7280;">{insight}</div>'
                     f'</div>',
                     unsafe_allow_html=True,
                 )
             else:
-                influence_color = "#14532d" if influence == "HIGH" else "#92400e"
-                influence_bg = "#dcfce7" if influence == "HIGH" else "#fef3c7"
-                influence_border = "#86efac" if influence == "HIGH" else "#fcd34d"
                 st.markdown(
                     f'<div class="narrative-card">'
-                    f'<div class="narrative-title">Client Narrative: {selected}'
-                    f'<span style="margin-left:0.6rem; padding:0.15rem 0.5rem; border-radius:999px; font-size:0.72rem; font-weight:700; background:{influence_bg}; color:{influence_color}; border:1px solid {influence_border};">'
-                    f'{influence} INFLUENCE</span></div>'
+                    f'<div class="narrative-title">Client Narrative: {selected}</div>'
                     f'<div class="narrative-label">Insight</div>'
                     f'<div class="narrative-body">{insight}</div>'
                     f'<div class="narrative-label">Recommended Action</div>'

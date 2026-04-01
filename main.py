@@ -1,6 +1,8 @@
 import json
 import os
-from dataclasses import dataclass, replace
+import re
+from collections import defaultdict
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -8,7 +10,6 @@ import networkx as nx
 import pandas as pd
 from dotenv import load_dotenv
 from openai import OpenAI
-from sentence_transformers import SentenceTransformer
 from sentence_transformers.cross_encoder import CrossEncoder
 
 ROOT = Path(__file__).resolve().parent
@@ -17,6 +18,63 @@ load_dotenv(ROOT / ".env")
 
 
 _cross_encoder_model: CrossEncoder | None = None
+
+
+@dataclass
+class Thread:
+        label: str
+        pri: float
+        lines: list[str] = field(default_factory=list)
+
+
+CLASSIFY_PROMPT = """\
+You are a graph-intelligence analyst. Classify each edge into exactly ONE
+category and assess its urgency.
+
+CATEGORIES (use these exact labels):
+    CONTROL   – ownership, directorship, shareholding, trusteeship, officer role,
+                             beneficial ownership, power of attorney, any corporate/legal control
+    FAMILY    – any family, kinship, or domestic relationship
+    SHARED_ID – shared address, phone, email, registration, or any identifier
+                             that co-links separate entities
+    RISK      – sanctions, PEP flags, adverse media, regulatory warnings, licence
+                             revocations, criminal records, compliance red flags
+    EVENT     – news mentions, lawsuits, bankruptcies, deaths, acquisitions, IPOs,
+                             succession events, or any other notable occurrence
+    OTHER     – anything that does not clearly fit the above
+
+For every edge return three fields:
+    cat – one of the category labels above
+    hot – true ONLY if it signals a TIME-SENSITIVE opportunity or threat
+                (e.g. recent death / succession / active lawsuit / new sanction /
+                live acquisition / bankruptcy filing)
+    pri – priority 0.0–1.0  (1.0 = most critical to an analyst)
+
+EDGES:
+{edges_json}
+
+Return ONLY a JSON array, same length and order as input. Example:
+[{{"cat":"CONTROL","hot":false,"pri":0.7}}, {{"cat":"EVENT","hot":true,"pri":0.95}}]"""
+
+NARRATIVE_PROMPT = """\
+You are an intelligence analyst. Write a concise briefing for:
+TARGET: {target}
+GOAL: {goal}
+
+Cover:
+    (1) Identity & controlled assets
+    (2) Events creating opportunity or risk
+    (3) Recommended approach angle
+
+Weave a coherent narrative. Prioritise ⚡ items. Do not enumerate—tell the story.
+
+GRAPH INTELLIGENCE:
+{ctx}
+
+Return ONLY JSON:
+{{"insight": "...", "recommended_action": "..."}}"""
+
+CHUNK_SIZE = 50
 
 
 def get_cross_encoder() -> CrossEncoder:
@@ -46,7 +104,6 @@ def cross_semantic_search(query_text: str, corpus_texts: list[str], top_k: int) 
 class LeadGenConfig:
     node_sheet: str = "Node"
     edge_sheet: str = "Edge"
-    embedding_model: str = "BAAI/bge-small-en-v1.5"
     retrieval_k: int = 50
     candidate_pool_size: int = 50
     edge_score_weight: float = 0.7
@@ -64,11 +121,8 @@ class LeadGenConfig:
 class GraphArtifacts:
     graph: nx.DiGraph
     topology: str
-    encoder: SentenceTransformer
     node_names: list[str]
-    node_embs: Any
     edges: list[tuple[str, str, dict[str, Any]]]
-    edge_embs: Any | None
 
 
 def with_topology(artifacts: GraphArtifacts, topology: str) -> GraphArtifacts:
@@ -142,25 +196,9 @@ def load_artifacts(
     topology = Path(topology_path).read_text(encoding="utf-8")
     graph = build_graph(excel_path, config.node_sheet, config.edge_sheet)
 
-    if status_callback:
-        status_callback("Initializing embedding model...")
-    print("Initializing embeddings...")
-    encoder = SentenceTransformer(config.embedding_model)
-
     node_names = list(graph.nodes)
-    if status_callback:
-        status_callback(f"Encoding {len(node_names)} nodes...")
-    node_texts = [node_context_text(graph, node) for node in node_names]
-    node_embs = encoder.encode(node_texts, convert_to_tensor=True)
 
     edges = [(u, v, d) for u, v, d in graph.edges(data=True)]
-    edge_embs = None
-    if edges:
-        if status_callback:
-            status_callback(f"Encoding {len(edges)} edges...")
-        edge_texts = [edge_context_text(graph, u, v, d) for u, v, d in edges]
-
-        edge_embs = encoder.encode(edge_texts, convert_to_tensor=True)
 
     if status_callback:
         status_callback("Artifacts ready.")
@@ -168,11 +206,8 @@ def load_artifacts(
     return GraphArtifacts(
         graph=graph,
         topology=topology,
-        encoder=encoder,
         node_names=node_names,
-        node_embs=node_embs,
         edges=edges,
-        edge_embs=edge_embs,
     )
 
 
@@ -329,86 +364,284 @@ def score_context(graph: nx.DiGraph, node: str) -> dict[str, Any]:
 
 
 
-def _node_attrs(graph: nx.DiGraph, n: str, limit: int = 200) -> dict[str, str]:
-    return {str(k): str(v)[:limit] for k, v in graph.nodes[n].items() if not pd.isna(v)}
+def _node_label(node: dict[str, Any] | None, fallback: str) -> str:
+    if not node:
+        return fallback
+
+    for key in ("Name", "name", "Title", "title", "label", "Label"):
+        value = node.get(key)
+        if value:
+            label = str(value).strip()
+            if label:
+                node_type = node.get("Type") or node.get("type")
+                if node_type:
+                    type_text = str(node_type).strip()
+                    if type_text:
+                        return f"{label}[{type_text}]"
+                return label
+
+    node_type = node.get("Type") or node.get("type")
+    if node_type:
+        type_text = str(node_type).strip()
+        if type_text:
+            return f"{fallback}[{type_text}]"
+    return fallback
 
 
-def _edge_rel(graph: nx.DiGraph, src: str, dst: str) -> dict[str, Any]:
-    d = graph[src][dst]
-    rel: dict[str, Any] = {
-        "edge_type": d["edge_type"],
-        "relation_text": relation_text(src, d["edge_type"], dst),
+def _edge_key(edge: dict[str, Any]) -> tuple[str, str, str]:
+    return str(edge["source"]), str(edge["edge_type"]), str(edge["target"])
+
+
+def _edge_desc(edge: dict[str, Any], nodes: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    source = str(edge["source"])
+    target = str(edge["target"])
+    desc: dict[str, Any] = {
+        "src": _node_label(nodes.get(source), source),
+        "rel": str(edge["edge_type"]),
+        "tgt": _node_label(nodes.get(target), target),
     }
-    if d.get("edge_info"):
-        rel["edge_info"] = str(d["edge_info"])[:300]
-    return rel
+    if edge.get("edge_info"):
+        desc["info"] = str(edge["edge_info"])[:250]
+
+    for nid in (source, target):
+        node = nodes.get(nid)
+        if not node:
+            continue
+        for key in ("title", "status", "description", "Title", "Status", "Description"):
+            value = node.get(key)
+            if value:
+                desc[f"{nid}_{key.lower()}"] = str(value)[:150]
+    return desc
 
 
-_HIGH_IMPACT = frozenset({
-    "owner", "owns", "director", "shareholder", "founder", "settlor",
-    "beneficiary", "trustee", "business ownership", "business profit",
-    "asset contributor", "has account", "sale of business",
-    "father", "mother", "spouse", "husband", "wife",
-    "son", "daughter", "sibling", "brother", "sister", "parent", "child", "family relationship",
-})
+def _safe_parse(raw: str, expected: int) -> list[dict[str, Any]]:
+    match = re.search(r"\[.*\]", raw, re.DOTALL)
+    if match:
+        try:
+            arr = json.loads(match.group())
+            if len(arr) == expected:
+                validated: list[dict[str, Any]] = []
+                for item in arr:
+                    pri_value = item.get("pri", 0.3)
+                    try:
+                        pri = float(pri_value)
+                    except (TypeError, ValueError):
+                        pri = 0.3
+                    validated.append({
+                        "cat": str(item.get("cat", "OTHER")).strip().upper() or "OTHER",
+                        "hot": bool(item.get("hot", False)),
+                        "pri": max(0.0, min(1.0, pri)),
+                    })
+                return validated
+        except (json.JSONDecodeError, ValueError, TypeError):
+            pass
+    return [{"cat": "OTHER", "hot": False, "pri": 0.3}] * expected
 
 
-def _edge_priority(edge_type: str) -> int:
-    return 0 if str(edge_type).strip().casefold() in _HIGH_IMPACT else 1
+def _collect(center: str, graph: nx.DiGraph, hops: int) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]], dict[str, list[dict[str, Any]]]]:
+    nodes: dict[str, dict[str, Any]] = {}
+    adj: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    seen_nodes: set[str] = set()
+    seen_edges: set[tuple[str, str, str]] = set()
+    edges: list[dict[str, Any]] = []
+    queue: list[tuple[str, int]] = [(center, 0)]
+
+    while queue:
+        nid, depth = queue.pop(0)
+        if nid in seen_nodes:
+            continue
+        seen_nodes.add(nid)
+        if not graph.has_node(nid):
+            continue
+
+        nodes[nid] = dict(graph.nodes[nid])
+
+        for source, target, data in list(graph.out_edges(nid, data=True)) + list(graph.in_edges(nid, data=True)):
+            edge = {
+                "source": str(source),
+                "target": str(target),
+                "edge_type": str(data.get("edge_type", "")),
+                "edge_info": data.get("edge_info", ""),
+            }
+            edge_key = _edge_key(edge)
+            if edge_key in seen_edges:
+                continue
+            seen_edges.add(edge_key)
+            edges.append(edge)
+            adj[edge["source"]].append(edge)
+            adj[edge["target"]].append(edge)
+
+            neighbor = target if str(source) == nid else source
+            if neighbor not in seen_nodes and depth < hops:
+                queue.append((str(neighbor), depth + 1))
+
+    return nodes, edges, adj
 
 
-def deep_node_context(graph: nx.DiGraph, node: str, max_hops: int = 1) -> dict[str, Any]:
-    attrs = _node_attrs(graph, node, limit=400)
-    relations = sorted(
-        [{"dir": "out", "target": nb, "target_attrs": _node_attrs(graph, nb), **_edge_rel(graph, node, nb)}
-         for nb in graph.neighbors(node)]
-        + [{"dir": "in", "source": p, "source_attrs": _node_attrs(graph, p), **_edge_rel(graph, p, node)}
-           for p in graph.predecessors(node)],
-        key=lambda r: _edge_priority(r["edge_type"]),
-    )
+def _classify(edges: list[dict[str, Any]], nodes: dict[str, dict[str, Any]], llm: OpenAI, model: str) -> list[dict[str, Any]]:
+    tags: list[dict[str, Any]] = []
+    for start in range(0, len(edges), CHUNK_SIZE):
+        chunk = edges[start : start + CHUNK_SIZE]
+        descs = [_edge_desc(edge, nodes) for edge in chunk]
+        prompt = CLASSIFY_PROMPT.format(edges_json=json.dumps(descs, ensure_ascii=False, default=str))
+        try:
+            response = llm.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+            )
+            raw = strip_fences(response.choices[0].message.content or "")
+        except Exception as exc:
+            if "context length" in str(exc).lower() and len(chunk) > 1:
+                midpoint = len(chunk) // 2
+                tags.extend(_classify(chunk[:midpoint], nodes, llm, model))
+                tags.extend(_classify(chunk[midpoint:], nodes, llm, model))
+                continue
+            raise
 
-    hops: dict[int, list[dict[str, Any]]] = {}
-    if max_hops >= 2:
-        visited = {node}
-        frontier: list = []
-        for nb in graph.neighbors(node):
-            visited.add(nb)
-            frontier.append(([node, nb], [relation_text(node, graph[node][nb]["edge_type"], nb)]))
-        for p in graph.predecessors(node):
-            if p not in visited:
-                visited.add(p)
-                frontier.append(([node, p], [relation_text(p, graph[p][node]["edge_type"], node)]))
+        tags.extend(_safe_parse(raw, len(chunk)))
 
-        for hop in range(2, max_hops + 1):
-            next_frontier = []
-            for path, chain in frontier:
-                tail = path[-1]
-                for nb in graph.neighbors(tail):
-                    if nb not in visited:
-                        visited.add(nb)
-                        next_frontier.append((path + [nb], chain + [relation_text(tail, graph[tail][nb]["edge_type"], nb)]))
-                for nb in graph.predecessors(tail):
-                    if nb not in visited:
-                        visited.add(nb)
-                        next_frontier.append((path + [nb], chain + [relation_text(nb, graph[nb][tail]["edge_type"], tail)]))
-            if next_frontier:
-                next_frontier.sort(key=lambda pc: min(
-                    _edge_priority(graph[pc[0][i]][pc[0][i+1]]["edge_type"]) if graph.has_edge(pc[0][i], pc[0][i+1])
-                    else _edge_priority(graph[pc[0][i+1]][pc[0][i]]["edge_type"])
-                    for i in range(len(pc[0]) - 1)
-                ))
-                hops[hop] = [
-                    {"path": " -> ".join(p), "relation_chain": c, "end_node_attrs": _node_attrs(graph, p[-1])}
-                    for p, c in next_frontier
-                ]
-            frontier = next_frontier
-            if not frontier:
-                break
+    return tags
 
-    result: dict[str, Any] = {"node": node, "attrs": attrs, "relations": relations}
-    if hops:
-        result["hops"] = hops
+
+def _eline(edge: dict[str, Any], nodes: dict[str, dict[str, Any]]) -> str:
+    source = str(edge["source"])
+    target = str(edge["target"])
+    text = f"{_node_label(nodes.get(source), source)}—[{edge['edge_type']}]→{_node_label(nodes.get(target), target)}"
+    if edge.get("edge_info"):
+        return f"{text} | {str(edge['edge_info'])[:120]}"
+    return text
+
+
+def _threads(
+    center: str,
+    nodes: dict[str, dict[str, Any]],
+    edges: list[dict[str, Any]],
+    adj: dict[str, list[dict[str, Any]]],
+    tags: list[dict[str, Any]],
+) -> list[Thread]:
+    edge_index = {_edge_key(edge): idx for idx, edge in enumerate(edges)}
+    buckets: dict[str, Thread] = {}
+    used: set[tuple[str, str, str]] = set()
+
+    def bucket(label: str) -> Thread:
+        thread = buckets.get(label)
+        if thread is None:
+            thread = Thread(label=label, pri=0.0, lines=[])
+            buckets[label] = thread
+        return thread
+
+    for edge, tag in zip(edges, tags):
+        if center not in (edge["source"], edge["target"]):
+            continue
+
+        cat = str(tag.get("cat", "OTHER")).strip().upper() or "OTHER"
+        hot = bool(tag.get("hot", False))
+        pri = float(tag.get("pri", 0.3))
+        label = f"⚡{cat}" if hot else cat
+        thread = bucket(label)
+        thread.label = label
+        thread.pri = max(thread.pri, pri)
+        thread.lines.append(("⚡ " if hot else "") + _eline(edge, nodes))
+        used.add(_edge_key(edge))
+
+        if cat == "CONTROL":
+            neighbor = edge["target"] if edge["source"] == center else edge["source"]
+            for edge2 in adj.get(str(neighbor), []):
+                edge2_key = _edge_key(edge2)
+                if edge2_key in used:
+                    continue
+                other = edge2["target"] if edge2["source"] == neighbor else edge2["source"]
+                if other == center:
+                    continue
+                linked_idx = edge_index.get(edge2_key)
+                if linked_idx is not None and str(tags[linked_idx].get("cat", "")).strip().upper() == "CONTROL":
+                    used.add(edge2_key)
+                    thread.lines.append(" ↳ " + _eline(edge2, nodes))
+
+        if cat == "FAMILY":
+            relation = edge["target"] if edge["source"] == center else edge["source"]
+            for edge2 in adj.get(str(relation), []):
+                edge2_key = _edge_key(edge2)
+                if edge2_key in used:
+                    continue
+                linked_idx = edge_index.get(edge2_key)
+                if linked_idx is not None and bool(tags[linked_idx].get("hot", False)):
+                    used.add(edge2_key)
+                    relation_name = _node_label(nodes.get(str(relation)), str(relation))
+                    thread.lines.append(f"  ⚡ via {relation_name}: {_eline(edge2, nodes)}")
+                    thread.pri = max(thread.pri, float(tags[linked_idx].get("pri", 0.3)))
+
+    clusters: dict[tuple[str, str], set[str]] = defaultdict(set)
+    for edge, tag in zip(edges, tags):
+        if str(tag.get("cat", "")).strip().upper() == "SHARED_ID":
+            clusters[(str(edge["edge_type"]), str(edge["target"]))].add(str(edge["source"]))
+
+    for (edge_type, target), sources in clusters.items():
+        if len(sources) < 2:
+            continue
+        thread = bucket("⚡HIDDEN_LINK")
+        thread.label = "⚡HIDDEN_LINK"
+        thread.pri = max(thread.pri, 0.85)
+        names = ", ".join(_node_label(nodes.get(source), source) for source in list(sources)[:10])
+        thread.lines.append(f"⚡ {edge_type}: {len(sources)} entities share {_node_label(nodes.get(target), target)}: {names}")
+
+    for edge, tag in zip(edges, tags):
+        edge_key = _edge_key(edge)
+        if edge_key in used:
+            continue
+        if bool(tag.get("hot", False)):
+            label = f"⚡{str(tag.get('cat', 'OTHER')).strip().upper() or 'OTHER'}_INDIRECT"
+            thread = bucket(label)
+            thread.label = label
+            thread.pri = max(thread.pri, float(tag.get("pri", 0.3)))
+            thread.lines.append("⚡ (2-hop) " + _eline(edge, nodes))
+            used.add(edge_key)
+
+    remainder = [
+        (edge, tags[idx])
+        for idx, edge in enumerate(edges)
+        if _edge_key(edge) not in used and center in (edge["source"], edge["target"])
+    ]
+    if remainder:
+        thread = bucket("OTHER")
+        thread.label = "OTHER"
+        thread.pri = max(thread.pri, max(float(tag.get("pri", 0.3)) for _, tag in remainder))
+        for edge, _ in remainder:
+            thread.lines.append(_eline(edge, nodes))
+            used.add(_edge_key(edge))
+
+    result = [thread for thread in buckets.values() if thread.lines]
+    result.sort(key=lambda item: item.pri, reverse=True)
     return result
+
+
+def _serialize(threads: list[Thread], budget: int) -> str:
+    blocks: list[str] = []
+    total = 0
+    for thread in threads:
+        block = f"【{thread.label}】 pri={thread.pri:.2f}\n" + "\n".join(f"  {line}" for line in thread.lines[:20]) + "\n"
+        if total + len(block) > budget:
+            break
+        blocks.append(block)
+        total += len(block)
+    return "\n".join(blocks)
+
+
+def _parse_narrative(raw: str) -> dict[str, str]:
+    raw_text = strip_fences(raw)
+    try:
+        parsed = json.loads(raw_text)
+    except json.JSONDecodeError:
+        return {"insight": raw_text, "recommended_action": ""}
+
+    if isinstance(parsed, dict):
+        return {
+            "insight": str(parsed.get("insight", "")),
+            "recommended_action": str(parsed.get("recommended_action", "")),
+        }
+
+    return {"insight": raw_text, "recommended_action": ""}
 
 
 def analyze_node(
@@ -417,98 +650,40 @@ def analyze_node(
     final_goal: str,
     config: LeadGenConfig,
     llm: OpenAI,
-    score_reason: str = "",
-    max_iterations: int = 5,
+    max_hops: int = 2,
+    max_ctx: int = 6000,
     hop_callback: Callable[[int, str, str], None] | None = None,
 ) -> dict[str, str]:
-    _SYSTEM = """Senior wealth-advisory analyst. Each turn: respond {{"explore": N}} (max depth 6, never repeat same depth) if promising chains are cut off, or return final JSON. Return immediately for LOW nodes."""
-
-    _USER = """GOAL: {goal}
-FLAGGED BECAUSE: {score_reason}
-DATA (depth={depth}):
-{context}
-
-━━ TRIAGE ━━
-CAPITAL-CONTROL: owner, owns, director, shareholder, founder, settlor, beneficiary, trustee, business ownership, business profit, asset contributor, has account, sale of business
-FAMILY: father, mother, parent, child, son, daughter, spouse, husband, wife, brother, sister, sibling, family relationship
-LOW-POWER: works for, works at, employee, employer, shared address, shared email, shared phone, mentions, revoked
-
-HIGH: ≥1 capital-control edge
-MEDIUM: no capital-control + ≥1 family edge to a node that has capital-control edges (verify in hops)
-LOW: everything else → 2–3 sentences on why no capital control, recommended_action = "Not recommended for outreach." Return JSON immediately.
-
-━━ BRIEFING (HIGH / MEDIUM only) ━━
-"insight" must contain three parts:
-1. WHO (2 sentences): name + CAPITAL-CONTROL roles/accounts only. Never mention LOW-POWER edges.
-2. CHAINS (2+, different themes): literal entity names from relations/hops as a step-by-step path —
-   A [edge] → B [edge] → C — financial implication for the GOAL.
-   Only CAPITAL-CONTROL or FAMILY edges at every step. Use hops for multi-hop paths.
-   MEDIUM: one chain must show the family member's capital and why this node is the entry path.
-3. WHY CONTACT: "Because [named path + evidence], therefore [consequence]" → specific product.
-
-"recommended_action": 3 items — verb + specific entity/amount from data + product/service.
-
-━━ EXAMPLE — HIGH ━━
-insight: "John Lee is a director of Beta Corp and a shareholder of Delta Financial. He holds a $4.2M account linked to Epsilon Trust.
-Chain 1 — Control: John Lee [director] → Beta Corp ← [60% owned by] Alpha Holdings → Beta Corp sold $12M to Gamma Industries — Lee controls reinvestment of that capital.
-Chain 2 — Wealth: John Lee [shareholder] → Delta Financial [beneficiary of] → Epsilon Trust [holds] → Lee's $4.2M account — corporate equity and trust structures need coordinated advice.
-Because Lee directs Beta Corp ($12M sale) and holds $4.2M through Epsilon Trust, he needs reinvestment structuring and estate planning."
-recommended_action: "1. Call re: $12M Beta Corp sale — controls capital allocation. 2. Review $4.2M Epsilon Trust account — integrated trust-portfolio strategy. 3. Meet re: Delta Financial shareholding — succession and liquidity planning."
-
-━━ EXAMPLE — MEDIUM ━━
-insight: "Mary Chen has no capital-control edges. She is the spouse of David Chen.
-Chain 1 — Family access: Mary Chen [spouse of] → David Chen [founder of] → Horizon Capital ($28M AUM) [owns 40% of] → Jade Properties — Mary is the entry path to David's $28M.
-Because David controls $28M via Horizon Capital, Mary is the natural introduction for estate and succession planning."
-recommended_action: "1. Invite Mary to wealth seminar — family financial wellness. 2. Request intro to David re: Horizon Capital ($28M) succession. 3. Propose joint estate review — $28M in business assets needs protection."
-
-━━ RETURN ━━
-{{"influence_level": "HIGH|MEDIUM|LOW", "insight": "...", "recommended_action": "..."}}
-Or: {{"explore": N}}"""
-
     graph = artifacts.graph
-    depth = 1
-    messages: list[dict[str, str]] = [{"role": "system", "content": _SYSTEM}]
+    hop_limit = max(1, min(max_hops, 6))
+    nodes, edges, adj = _collect(node, graph, hop_limit)
 
-    for _ in range(max_iterations):
-        ctx = deep_node_context(graph, node, max_hops=depth)
-        if hop_callback:
-            hop_callback(depth, "fetching", f"{len(ctx.get('relations', []))} direct relations, {sum(len(v) for v in ctx.get('hops', {}).values())} extended paths")
-
-        messages.append({"role": "user", "content": _USER.format(
-            goal=final_goal, score_reason=score_reason, depth=depth,
-            context=json.dumps(ctx, ensure_ascii=False, default=str),
-        )})
-        raw = strip_fences(llm.chat.completions.create(
-            model=config.llm_model, messages=messages, temperature=0.2,
-        ).choices[0].message.content)
-        messages.append({"role": "assistant", "content": raw})
-
-        try:
-            result = json.loads(raw)
-        except json.JSONDecodeError:
-            break
-
-        if "explore" in result:
-            if min(int(result["explore"]), 6) <= depth:
-                break
-            depth += 1
-            if hop_callback:
-                hop_callback(depth - 1, "explore_requested", f"→ Hop {depth}")
-            continue
-
-        influence = result.get("influence_level", "MEDIUM")
-        if hop_callback:
-            hop_callback(depth, "final", influence)
-        return {"influence_level": influence, "insight": result.get("insight", ""), "recommended_action": result.get("recommended_action", "")}
-
-    messages.append({"role": "user", "content": "Produce the final briefing now. Return ONLY the JSON with influence_level, insight, and recommended_action."})
-    result = json.loads(strip_fences(llm.chat.completions.create(
-        model=config.llm_model, messages=messages, temperature=0.2,
-    ).choices[0].message.content))
-    influence = result.get("influence_level", "MEDIUM")
     if hop_callback:
-        hop_callback(depth, "final", influence)
-    return {"influence_level": influence, "insight": result.get("insight", ""), "recommended_action": result.get("recommended_action", "")}
+        hop_callback(hop_limit, "fetching", f"{len(nodes)} nodes, {len(edges)} edges")
+
+    tags = _classify(edges, nodes, llm, config.llm_model)
+    threads = _threads(node, nodes, edges, adj, tags)
+    ctx = _serialize(threads, max_ctx)
+
+    prompt = NARRATIVE_PROMPT.format(
+        target=_node_label(nodes.get(node), node),
+        goal=final_goal,
+        ctx=ctx,
+    )
+    response = llm.chat.completions.create(
+        model=config.llm_model,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2,
+    )
+    result = _parse_narrative(response.choices[0].message.content or "")
+
+    if hop_callback:
+        hop_callback(hop_limit, "final", result.get("recommended_action", ""))
+
+    return {
+        "insight": result.get("insight", ""),
+        "recommended_action": result.get("recommended_action", ""),
+    }
 
 
 def score_batch(
@@ -712,14 +887,19 @@ def generate_targets(
 
 if __name__ == "__main__":
     config = LeadGenConfig(debug=True, auto_write_rules=False)
+    artifacts = load_artifacts("COI_Template.xlsx", "topology.md", config)
+    llm = init_llm_client()
+    final_goal = "Identify high-potential leads for financial services based on their relationships and attributes in the graph."
+    node = "Roy Bagattini"
+    print("\n=== analyze_node test ===")
+    print(analyze_node(node, artifacts, final_goal, config, llm))
 
-    targets = generate_targets(
-        excel_path="COI_Template.xlsx",
-        final_goal="Increase financial product sales revenue by identifying high-value prospective clients",
-        topology_path="topology.md",
-        config=config
-    )
-
-    print("\n=== High-Priority Target List ===")
-    for target in targets[:10]:
-        print(f"  {target['node_name']} | {target['score']} | {target['reason']}")
+    # targets = generate_targets(
+    #     excel_path="COI_Template.xlsx",
+    #     final_goal=final_goal,
+    #     topology_path="topology.md",
+    #     config=config,
+    # )
+    # print("\n=== High-Priority Target List ===")
+    # for target in targets[:10]:
+    #     print(f"  {target['node_name']} | {target['score']} | {target['reason']}")
