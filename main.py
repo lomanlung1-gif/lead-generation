@@ -472,14 +472,14 @@ def generate_targets(
     final_goal: str,
     topology_path: str = "topology.md",
     config: LeadGenConfig | None = None,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], list[str]]:
     cfg = config or LeadGenConfig()
     artifacts = load_artifacts(excel_path, topology_path, cfg)
     llm = init_llm_client()
 
     candidates = retrieve_candidates(artifacts, cfg)
     if not candidates:
-        return []
+        return [], []
 
     print(f"Scoring {len(candidates)} candidates...")
     all_results: list[dict[str, Any]] = []
@@ -492,17 +492,17 @@ def generate_targets(
             all_results.extend(targets)
     except Exception as exc:
         print(f"LLM error: {exc}")
-        return []
+        return [], []
 
     final_results = dedupe_and_sort(all_results)
 
-    if cfg.auto_write_rules:
-        print("Discovering topology rules...")
-        new_rules = discover_rules(final_results, artifacts, final_goal, cfg, llm)
-        if new_rules:
-            append_rules(topology_path, new_rules)
+    print("Discovering topology rules...")
+    new_rules = discover_rules(final_results, artifacts, final_goal, cfg, llm)
 
-    return final_results
+    if cfg.auto_write_rules and new_rules:
+        append_rules(topology_path, new_rules)
+
+    return final_results, new_rules
 
 
 if __name__ == "__main__":
@@ -516,7 +516,7 @@ if __name__ == "__main__":
     # print("\n=== analyze_node test ===")
     # print(analyze_node(node, artifacts, final_goal, config, llm))
 
-    targets = generate_targets(
+    targets, new_rules = generate_targets(
         excel_path="COI_Template.xlsx",
         final_goal=final_goal,
         topology_path="topology.md",
@@ -525,3 +525,7 @@ if __name__ == "__main__":
     print("\n=== High-Priority Target List ===")
     for target in targets[:10]:
         print(f"  {target['node_name']} | {target['score']} | {target['reason']}")
+
+    print(f"\n=== Discovered Rules ({len(new_rules)}) ===")
+    for rule in new_rules:
+        print(f"  - {rule}")
