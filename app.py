@@ -476,6 +476,7 @@ with st.container(border=True):
                                     final_goal=goal,
                                     config=cfg,
                                     llm=llm,
+                                    score_reason=str(selected_row.get("reason", "")),
                                     hop_callback=on_hop,
                                 )
                                 st.session_state.node_analysis[selected_node] = {"result": analysis, "hop_log": list(hop_log)}
